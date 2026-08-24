@@ -1,0 +1,113 @@
+# Ignore Visual Studio cache/options directory
+.vs/
+.vscode/
+
+# Ignore local user-specific files
+*.user
+*.suo
+*.cache
+*.VC.db
+*.VC.VC.opendb
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio cache/options directory
+.vs/
+
+# NUnit 3 - Some properties might be discovery related instead MSBuild related properties
+*.nunit
+
+# Publish folder
+publish/
+PublishProfiles/
+
+# ReSharper is a .NET coding add-in
+.resharper
+.resharper.user
+*.resharper
+*.resharper.user
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Local NuGet cache
+.nuget/
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Configuration files with sensitive data
+appsettings.Development.json
+appsettings.*.json
+src/Bot.MorningJob.Console/appsettings.json
+!src/Bot.MorningJob.Console/appsettings.template.json
+
+# Private keys / secrets - never commit these
+*.ppk
+*.pem
+Config/keys/
+!appsettings.json
+
+# Log files
+logs/
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Report output
+reports/
+output/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules (if using npm packages)
+node_modules/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# SSL/Certificate files
+*.pem
+*.key
+*.crt
+*.pfx
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# macOS
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,406 @@
+using Bot.MorningJob.Console.Integrations.SFTP;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
+
+namespace Bot.MorningJob.Console.Integrations.Int002
+{
+    /// <summary>
+    /// Result of an INT002 sync run.
+    /// </summary>
+    public class Int002SyncResult
+    {
+        public int JobRunId { get; set; }
+        public DateTime RunningAtUtc { get; set; }
+        public List<string> NewProcessedFiles { get; set; } = new();
+        public List<string> NewFailedFiles { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Syncs INT002 processed/failed files from SFTP to a local folder structure
+    /// (C:\Drive\MorningJob\INT002\Processed and \Failed) and records job runs
+    /// and copied files in SQL Server.
+    /// </summary>
+    public interface IInt002SyncService
+    {
+        Task<Int002SyncResult> SyncAsync();
+    }
+
+    public class Int002SyncService : IInt002SyncService
+    {
+        private const string IntegrationFolderName = "INT002";
+        private const string ProcessedFolderName = "Processed";
+        private const string FailedFolderName = "Failed";
+        private const string IntegrationDisplayName = "INT002 PayGlobal Worker Inbound";
+
+        private readonly ILogger<Int002SyncService> _logger;
+        private readonly ISftpService _sftpService;
+        private readonly SftpSettings _sftpSettings;
+        private readonly Int002SyncSettings _settings;
+
+        public Int002SyncService(
+            ILogger<Int002SyncService> logger,
+            ISftpService sftpService,
+            IOptions<AppSettings> appSettings)
+        {
+            _logger = logger;
+            _sftpService = sftpService;
+            _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
+            _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
+        }
+
+        public async Task<Int002SyncResult> SyncAsync()
+        {
+            var localRoot = string.IsNullOrWhiteSpace(_settings.LocalRootPath)
+                ? @"C:\Drive\MorningJob"
+                : _settings.LocalRootPath;
+
+            var connectionString = _settings.SqlConnectionString
+                ?? throw new InvalidOperationException("AppSettings:Int002Sync:SqlConnectionString is not configured.");
+
+            var processedLocalDir = Path.Combine(localRoot, IntegrationFolderName, ProcessedFolderName);
+            var failedLocalDir = Path.Combine(localRoot, IntegrationFolderName, FailedFolderName);
+            Directory.CreateDirectory(processedLocalDir);
+            Directory.CreateDirectory(failedLocalDir);
+
+            await EnsureDatabaseAsync(connectionString);
+
+            var runningAtUtc = DateTime.UtcNow;
+            var jobRunId = await InsertJobRunAsync(connectionString, runningAtUtc);
+
+            var result = new Int002SyncResult
+            {
+                JobRunId = jobRunId,
+                RunningAtUtc = runningAtUtc
+            };
+
+            var processedDirectory = _sftpSettings.ProcessedDirectory ?? "/INT002/PROD/processed";
+            var failedDirectory = _sftpSettings.FailedDirectory ?? "/INT002/PROD/failed";
+
+            await _sftpService.ConnectAsync();
+
+            try
+            {
+                var existingProcessed = await GetExistingFileNamesAsync(connectionString, "Int002ProcessedFiles");
+                var existingFailed = await GetExistingFileNamesAsync(connectionString, "Int002FailedFiles");
+
+                var remoteProcessedFiles = await _sftpService.GetFilesAsync(processedDirectory);
+                var remoteFailedFiles = await _sftpService.GetFilesAsync(failedDirectory);
+
+                foreach (var file in remoteProcessedFiles)
+                {
+                    if (string.IsNullOrWhiteSpace(file.Name) || string.IsNullOrWhiteSpace(file.FullPath))
+                    {
+                        continue;
+                    }
+
+                    if (existingProcessed.Contains(file.Name))
+                    {
+                        continue;
+                    }
+
+                    var localPath = Path.Combine(processedLocalDir, file.Name);
+                    await _sftpService.DownloadFileAsync(file.FullPath, localPath);
+
+                    var copiedAtUtc = DateTime.UtcNow;
+                    await InsertFileRecordAsync(connectionString, "Int002ProcessedFiles", jobRunId, file.Name, copiedAtUtc);
+
+                    result.NewProcessedFiles.Add(file.Name);
+                    _logger.LogInformation("Copied new processed file {FileName} to {LocalPath}", file.Name, localPath);
+                }
+
+                var failedFileErrorCounts = new List<(string NormalizedFileName, int ErrorCount)>();
+                string? workUploadDir = null;
+
+                foreach (var file in remoteFailedFiles)
+                {
+                    if (string.IsNullOrWhiteSpace(file.Name) || string.IsNullOrWhiteSpace(file.FullPath))
+                    {
+                        continue;
+                    }
+
+                    if (existingFailed.Contains(file.Name))
+                    {
+                        continue;
+                    }
+
+                    var localPath = Path.Combine(failedLocalDir, file.Name);
+                    await _sftpService.DownloadFileAsync(file.FullPath, localPath);
+
+                    var copiedAtUtc = DateTime.UtcNow;
+                    await InsertFileRecordAsync(connectionString, "Int002FailedFiles", jobRunId, file.Name, copiedAtUtc);
+
+                    result.NewFailedFiles.Add(file.Name);
+                    _logger.LogInformation("Copied new failed file {FileName} to {LocalPath}", file.Name, localPath);
+
+                    var errorCount = CountDataRows(localPath);
+                    var normalizedFileName = NormalizeFileName(file.Name);
+                    failedFileErrorCounts.Add((normalizedFileName, errorCount));
+
+                    workUploadDir ??= GetTodaysWorkUploadFolder();
+                    var workUploadPath = Path.Combine(workUploadDir, file.Name);
+                    File.Copy(localPath, workUploadPath, overwrite: true);
+                    _logger.LogInformation("Copied failed file {FileName} to manual upload folder {WorkUploadPath}", file.Name, workUploadPath);
+                }
+
+                if (failedFileErrorCounts.Count > 0)
+                {
+                    await CreateReportAsync(connectionString, jobRunId, failedFileErrorCounts);
+                }
+
+                if (workUploadDir != null)
+                {
+                    OpenFolderInExplorer(workUploadDir);
+                }
+            }
+            finally
+            {
+                _sftpService.Disconnect();
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Mirrors the existing manual batch script: builds (and creates if missing) a
+        /// C:\work\yyyy\mm\dd folder for today's date, where new failed files are copied
+        /// for manual upload to SharePoint.
+        /// </summary>
+        private string GetTodaysWorkUploadFolder()
+        {
+            var workRoot = string.IsNullOrWhiteSpace(_settings.WorkUploadRootPath)
+                ? @"C:\work"
+                : _settings.WorkUploadRootPath;
+
+            var today = DateTime.Now;
+            var folder = Path.Combine(workRoot, today.ToString("yyyy"), today.ToString("MM"), today.ToString("dd"));
+            Directory.CreateDirectory(folder);
+            return folder;
+        }
+
+        private void OpenFolderInExplorer(string folderPath)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = folderPath,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to open work upload folder {FolderPath} in Explorer.", folderPath);
+            }
+        }
+
+        /// <summary>
+        /// Strips the trailing "_PayGlobal_yyyy-MM-dd_HHmmss" date/time component and extension from
+        /// a file name, then removes separators to produce a compact item name.
+        /// e.g. "SupervisoryOrgData_PayGlobal_2026-06-15_210026.csv" -> "SupervisoryOrgData"
+        ///      "Non-Manager_WorkerData_PayGlobal_2026-06-15_210036.csv" -> "NonManagerWorkerData"
+        /// </summary>
+        private static string NormalizeFileName(string fileName)
+        {
+            var withoutExtension = Path.GetFileNameWithoutExtension(fileName);
+            var withoutSuffix = Regex.Replace(withoutExtension, @"_PayGlobal_\d{4}-\d{2}-\d{2}_\d{6}$", string.Empty);
+            return withoutSuffix.Replace("-", string.Empty).Replace("_", string.Empty);
+        }
+
+        /// <summary>
+        /// Counts data rows in a CSV file, excluding the header row.
+        /// </summary>
+        private static int CountDataRows(string filePath)
+        {
+            var lineCount = 0;
+            using var reader = new StreamReader(filePath);
+            while (reader.ReadLine() != null)
+            {
+                lineCount++;
+            }
+
+            return Math.Max(0, lineCount - 1);
+        }
+
+        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount)> failedFileErrorCounts)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            const string insertReportSql = @"
+INSERT INTO Reports (JobRunId, ReportDate) VALUES (@JobRunId, @ReportDate);
+SELECT CAST(SCOPE_IDENTITY() AS INT);";
+
+            int reportId;
+            await using (var reportCommand = new SqlCommand(insertReportSql, connection))
+            {
+                reportCommand.Parameters.AddWithValue("@JobRunId", jobRunId);
+                reportCommand.Parameters.AddWithValue("@ReportDate", DateTime.UtcNow);
+                reportId = Convert.ToInt32(await reportCommand.ExecuteScalarAsync());
+            }
+
+            const string insertReportLineSql = @"
+INSERT INTO ReportLines (ReportId, GroupName, Integration, ItemName, ErrorCount, LineText, RecordedOn)
+VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, @RecordedOn);";
+
+            var recordedOnUtc = DateTime.UtcNow;
+
+            foreach (var (normalizedFileName, errorCount) in failedFileErrorCounts)
+            {
+                var errorWord = errorCount == 1 ? "Error" : "Errors";
+                var lineText = $" \u2022{normalizedFileName,-22}- {errorCount} Data {errorWord}(s)";
+
+                await using var lineCommand = new SqlCommand(insertReportLineSql, connection);
+                lineCommand.Parameters.AddWithValue("@ReportId", reportId);
+                lineCommand.Parameters.AddWithValue("@GroupName", "Pay Global Issues");
+                lineCommand.Parameters.AddWithValue("@Integration", IntegrationDisplayName);
+                lineCommand.Parameters.AddWithValue("@ItemName", normalizedFileName);
+                lineCommand.Parameters.AddWithValue("@ErrorCount", errorCount);
+                lineCommand.Parameters.AddWithValue("@LineText", lineText);
+                lineCommand.Parameters.AddWithValue("@RecordedOn", recordedOnUtc);
+                await lineCommand.ExecuteNonQueryAsync();
+            }
+        }
+
+        private static async Task EnsureDatabaseAsync(string connectionString)
+        {
+            var builder = new SqlConnectionStringBuilder(connectionString);
+            var databaseName = builder.InitialCatalog;
+
+            if (string.IsNullOrWhiteSpace(databaseName))
+            {
+                throw new InvalidOperationException("SQL connection string must specify an initial catalog (database name).");
+            }
+
+            builder.InitialCatalog = "master";
+
+            await using (var masterConnection = new SqlConnection(builder.ConnectionString))
+            {
+                await masterConnection.OpenAsync();
+
+                var createDbSql = $@"
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = N'{databaseName}')
+BEGIN
+    CREATE DATABASE [{databaseName}];
+END";
+
+                await using var createDbCommand = new SqlCommand(createDbSql, masterConnection);
+                await createDbCommand.ExecuteNonQueryAsync();
+            }
+
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            var createTablesSql = @"
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'JobRun')
+BEGIN
+    CREATE TABLE JobRun (
+        JobRunId INT IDENTITY(1,1) PRIMARY KEY,
+        RunningAt DATETIME2 NOT NULL
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Int002ProcessedFiles')
+BEGIN
+    CREATE TABLE Int002ProcessedFiles (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        JobRunId INT NOT NULL,
+        FileName NVARCHAR(500) NOT NULL,
+        CopiedAt DATETIME2 NOT NULL,
+        CONSTRAINT FK_Int002ProcessedFiles_JobRun FOREIGN KEY (JobRunId) REFERENCES JobRun(JobRunId)
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Int002FailedFiles')
+BEGIN
+    CREATE TABLE Int002FailedFiles (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        JobRunId INT NOT NULL,
+        FileName NVARCHAR(500) NOT NULL,
+        CopiedAt DATETIME2 NOT NULL,
+        CONSTRAINT FK_Int002FailedFiles_JobRun FOREIGN KEY (JobRunId) REFERENCES JobRun(JobRunId)
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Reports')
+BEGIN
+    CREATE TABLE Reports (
+        ReportId INT IDENTITY(1,1) PRIMARY KEY,
+        JobRunId INT NOT NULL,
+        ReportDate DATETIME2 NOT NULL,
+        CONSTRAINT FK_Reports_JobRun FOREIGN KEY (JobRunId) REFERENCES JobRun(JobRunId)
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ReportLines')
+BEGIN
+    CREATE TABLE ReportLines (
+        ReportLineId INT IDENTITY(1,1) PRIMARY KEY,
+        ReportId INT NOT NULL,
+        GroupName NVARCHAR(200) NOT NULL,
+        Integration NVARCHAR(200) NOT NULL,
+        ItemName NVARCHAR(500) NOT NULL,
+        ErrorCount INT NULL,
+        LineText NVARCHAR(1000) NOT NULL,
+        RecordedOn DATETIME2 NOT NULL,
+        CONSTRAINT FK_ReportLines_Reports FOREIGN KEY (ReportId) REFERENCES Reports(ReportId)
+    );
+END";
+
+            await using var createTablesCommand = new SqlCommand(createTablesSql, connection);
+            await createTablesCommand.ExecuteNonQueryAsync();
+        }
+
+        private static async Task<int> InsertJobRunAsync(string connectionString, DateTime runningAtUtc)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            const string sql = @"
+INSERT INTO JobRun (RunningAt) VALUES (@RunningAt);
+SELECT CAST(SCOPE_IDENTITY() AS INT);";
+
+            await using var command = new SqlCommand(sql, connection);
+            command.Parameters.AddWithValue("@RunningAt", runningAtUtc);
+
+            var result = await command.ExecuteScalarAsync();
+            return Convert.ToInt32(result);
+        }
+
+        private static async Task<HashSet<string>> GetExistingFileNamesAsync(string connectionString, string tableName)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            var sql = $"SELECT DISTINCT FileName FROM {tableName};";
+
+            await using var command = new SqlCommand(sql, connection);
+            await using var reader = await command.ExecuteReaderAsync();
+
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (await reader.ReadAsync())
+            {
+                names.Add(reader.GetString(0));
+            }
+
+            return names;
+        }
+
+        private static async Task InsertFileRecordAsync(string connectionString, string tableName, int jobRunId, string fileName, DateTime copiedAtUtc)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            var sql = $"INSERT INTO {tableName} (JobRunId, FileName, CopiedAt) VALUES (@JobRunId, @FileName, @CopiedAt);";
+
+            await using var command = new SqlCommand(sql, connection);
+            command.Parameters.AddWithValue("@JobRunId", jobRunId);
+            command.Parameters.AddWithValue("@FileName", fileName);
+            command.Parameters.AddWithValue("@CopiedAt", copiedAtUtc);
+
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+}
