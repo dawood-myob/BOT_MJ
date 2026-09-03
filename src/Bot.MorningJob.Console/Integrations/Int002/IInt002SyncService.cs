@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
+using Bot.MorningJob.Console.Integrations.Database;
 
 namespace Bot.MorningJob.Console.Integrations.Int002
 {
@@ -38,16 +39,19 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
         private readonly ILogger<Int002SyncService> _logger;
         private readonly ISftpService _sftpService;
+        private readonly IDatabaseService _databaseService;
         private readonly SftpSettings _sftpSettings;
         private readonly Int002SyncSettings _settings;
 
         public Int002SyncService(
             ILogger<Int002SyncService> logger,
             ISftpService sftpService,
+            IDatabaseService databaseService,
             IOptions<AppSettings> appSettings)
         {
             _logger = logger;
             _sftpService = sftpService;
+            _databaseService = databaseService;
             _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
             _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
         }
@@ -112,7 +116,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     _logger.LogInformation("Copied new processed file {FileName} to {LocalPath}", file.Name, localPath);
                 }
 
-                var failedFileErrorCounts = new List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)>();
+                var failedFileErrorCounts = new List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)>();
                 string? workUploadDir = null;
 
                 foreach (var file in remoteFailedFiles)
@@ -138,7 +142,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
                     var errorRowNumbers = GetDataRowNumbers(localPath);
                     var normalizedFileName = NormalizeFileName(file.Name);
-                    failedFileErrorCounts.Add((normalizedFileName, errorRowNumbers.Count, errorRowNumbers));
+                    var fileDate = ExtractFileDate(file.Name);
+                    failedFileErrorCounts.Add((normalizedFileName, errorRowNumbers.Count, errorRowNumbers, fileDate));
 
                     workUploadDir ??= GetTodaysWorkUploadFolder();
                     var workUploadPath = Path.Combine(workUploadDir, file.Name);
@@ -152,7 +157,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 }
 
                 workUploadDir ??= GetTodaysWorkUploadFolder();
-                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts);
+                var stripeLatestCompleted = await _databaseService.GetStripeLatestCompletedAsync();
+                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted);
                 _logger.LogInformation("Generated daily report file at {ReportFilePath}", reportFilePath);
 
                 OpenFolderInExplorer(workUploadDir);
@@ -212,6 +218,25 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         }
 
         /// <summary>
+        /// Extracts the "_PayGlobal_yyyy-MM-dd_" date component from a file name, if present.
+        /// Used to indicate which date's file is being reported on Monday runs, when the
+        /// SFTP failed folder may contain a backlog of Saturday/Sunday files alongside Monday's.
+        /// </summary>
+        private static DateOnly? ExtractFileDate(string fileName)
+        {
+            var match = Regex.Match(fileName, @"_PayGlobal_(\d{4})-(\d{2})-(\d{2})_\d{6}");
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            var year = int.Parse(match.Groups[1].Value);
+            var month = int.Parse(match.Groups[2].Value);
+            var day = int.Parse(match.Groups[3].Value);
+            return new DateOnly(year, month, day);
+        }
+
+        /// <summary>
         /// Returns the 1-based data row numbers (excluding the header row) for every row in a CSV file.
         /// Currently every data row is treated as an "error row" since these files come from the
         /// SFTP "failed" directory. Row numbers are used for the report line, e.g. "(28,29,30)".
@@ -248,11 +273,13 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private string GenerateDailyReportTextFile(
             string workUploadDir,
             DateTimeOffset runningAtUtc,
-            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
+            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
+            DateTime? stripeLatestCompleted)
         {
             var reportDate = runningAtUtc.LocalDateTime;
             var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
             var reportFilePath = Path.Combine(workUploadDir, reportFileName);
+            var isMonday = reportDate.DayOfWeek == DayOfWeek.Monday;
 
             var sb = new StringBuilder();
             sb.AppendLine("Pay Global Issues");
@@ -260,9 +287,9 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine("INT002");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
 
-            AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts);
-            AppendInt002Line(sb, "NonManagerWorkerData", failedFileErrorCounts);
-            AppendInt002Line(sb, "ManagerWorkerData", failedFileErrorCounts);
+            AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts, isMonday);
+            AppendInt002Line(sb, "NonManagerWorkerData", failedFileErrorCounts, isMonday);
+            AppendInt002Line(sb, "ManagerWorkerData", failedFileErrorCounts, isMonday);
 
             sb.AppendLine();
             if (failedFileErrorCounts.Count > 0)
@@ -278,10 +305,10 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("INT003");
-            sb.AppendLine($" \u2666 Completed OK/Warning/Error on {FormatOrdinalDate(reportDate)}");
+            sb.AppendLine($" \u2666 Completed --- | recorded on {FormatOrdinalDate(reportDate)}");
             sb.AppendLine();
             sb.AppendLine();
-            sb.AppendLine("Banking Issues  ");
+            sb.AppendLine($"Banking Issues recorded on {FormatOrdinalDate(reportDate)}");
             sb.AppendLine(" \u2666 Westpac/ANZ/CBA - (No retrieved documents found) as usual");
             sb.AppendLine();
             sb.AppendLine();
@@ -307,11 +334,15 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
             sb.AppendLine();
             sb.AppendLine();
+            sb.AppendLine("Sumo Logs");
             sb.AppendLine("Execute Data Change: PG_PayrollbyWorker_TBL SFTP DCT");
             sb.AppendLine();
             sb.AppendLine();
-            sb.AppendLine("DB");
-            sb.AppendLine(" \u2666 Stripe Latest completed - " + reportDate.ToString("dd-MM-yyyy HH:mm"));
+            sb.AppendLine($"DB - Recorded on {FormatOrdinalDate(reportDate)}");
+            var stripeLatestCompletedText = stripeLatestCompleted.HasValue
+                ? stripeLatestCompleted.Value.ToString("dd-MM-yyyy HH:mm")
+                : "Unavailable";
+            sb.AppendLine($" \u2666 Stripe Latest completed - {stripeLatestCompletedText}");
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("Miscellaneous Issues");
@@ -333,14 +364,21 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private static void AppendInt002Line(
             StringBuilder sb,
             string itemName,
-            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
+            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
+            bool isMonday)
         {
             var match = failedFileErrorCounts.FirstOrDefault(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase));
             var errorCount = match.NormalizedFileName != null ? match.ErrorCount : 0;
             var rowNumbers = match.NormalizedFileName != null ? match.ErrorRowNumbers : new List<int>();
 
             var errorWord = errorCount == 1 ? "Error" : "Errors";
-            var rowNumbersText = rowNumbers.Count > 0 ? $" ({string.Join(",", rowNumbers)})" : string.Empty;
+
+            // Monday runs may see a backlog of Saturday/Sunday files in the SFTP failed folder,
+            // so the row numbers are annotated with the specific file date. Tuesday-Friday runs
+            // only ever contain the previous day's file, so the row-number detail is omitted.
+            var rowNumbersText = isMonday && rowNumbers.Count > 0
+                ? $" ({string.Join(",", rowNumbers)}{(match.FileDate.HasValue ? $" - {match.FileDate.Value:dd-MM-yyyy}" : string.Empty)})"
+                : string.Empty;
 
             sb.AppendLine($" \u2666{itemName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}");
         }
@@ -359,7 +397,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             return $"{day}{suffix} {date:MMMM}";
         }
 
-        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
+        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts)
         {
             await using var connection = new SqlConnection(connectionString);
             await connection.OpenAsync();
@@ -382,7 +420,7 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
 
             var recordedOnUtc = DateTime.UtcNow;
 
-            foreach (var (normalizedFileName, errorCount, errorRowNumbers) in failedFileErrorCounts)
+            foreach (var (normalizedFileName, errorCount, errorRowNumbers, _) in failedFileErrorCounts)
             {
                 var errorWord = errorCount == 1 ? "Error" : "Errors";
                 var rowNumbersText = errorRowNumbers.Count > 0 ? $" ({string.Join(",", errorRowNumbers)})" : string.Empty;

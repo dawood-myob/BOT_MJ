@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Bot.MorningJob.Console.Integrations.SFTP;
 using Bot.MorningJob.Console.Integrations.Int002;
+using Bot.MorningJob.Console.Integrations.Database;
 using Serilog;
 using System.Reflection;
 
@@ -69,6 +70,7 @@ namespace Bot.MorningJob.Console
 
             // Register services
             services.AddScoped<ISftpService, SftpService>();
+            services.AddScoped<IDatabaseService, DatabaseService>();
             services.AddScoped<IInt002SyncService, Int002SyncService>();
 
             // Application service
@@ -218,6 +220,7 @@ namespace Bot.MorningJob.Console
         public string? Username { get; set; }
         public string? Password { get; set; }
         public string? QueryTable { get; set; }
+        public string? PgWebBaseUrl { get; set; }
     }
 
     public class ReportSettings
