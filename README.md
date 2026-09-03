@@ -232,8 +232,24 @@ To run this application on a schedule:
 ### Windows Task Scheduler
 1. Create a new task in Task Scheduler
 2. Set trigger for desired time (e.g., 6:00 AM daily)
-3. Set action to execute: `C:\path\to\publish\Bot.MorningJob.Console.exe`
+3. Set action to execute PowerShell running `Run-MorningJob.ps1` (see below), **not** the
+   `.exe` directly, so the Stripe database pgweb proxy is started/stopped automatically:
+   ```
+   powershell.exe -ExecutionPolicy Bypass -File "C:\path\to\Bot.MorningJob.Console\Run-MorningJob.ps1"
+   ```
 4. Configure working directory as needed
+
+#### Run-MorningJob.ps1
+
+`Run-MorningJob.ps1` wraps the full daily run so no manual database access is required:
+1. Authenticates via `myob-auth kube-login`.
+2. Starts `myob-auth kube db-proxy` in the background (forwards to a local pgweb API).
+3. Waits for the proxy to become reachable.
+4. Runs `Bot.MorningJob.Console.exe`.
+5. Stops the proxy process afterward (even on failure).
+
+If the proxy fails to start/authenticate (e.g., expired credentials), the job still completes;
+the report's "Stripe Latest completed" line will show `Unavailable` instead of failing the run.
 
 ### Linux Cron
 ```bash
