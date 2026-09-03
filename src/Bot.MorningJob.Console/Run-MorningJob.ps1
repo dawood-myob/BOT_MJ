@@ -79,8 +79,15 @@ try {
     }
 
     Write-Log "Running $ExePath ..."
-    & $ExePath
-    $exitCode = $LASTEXITCODE
+    $exeDir = Split-Path -Parent $ExePath
+    Push-Location $exeDir
+    try {
+        & $ExePath
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
     Write-Log "Bot.MorningJob.Console exited with code $exitCode."
 }
 finally {
