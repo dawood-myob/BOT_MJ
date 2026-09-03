@@ -65,7 +65,6 @@ src/Bot.MorningJob.Console/appsettings.json
 *.ppk
 *.pem
 Config/keys/
-!appsettings.json
 
 # Log files
 logs/

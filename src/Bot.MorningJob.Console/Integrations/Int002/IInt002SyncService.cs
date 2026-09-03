@@ -3,6 +3,7 @@ using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Bot.MorningJob.Console.Integrations.Int002
@@ -111,7 +112,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     _logger.LogInformation("Copied new processed file {FileName} to {LocalPath}", file.Name, localPath);
                 }
 
-                var failedFileErrorCounts = new List<(string NormalizedFileName, int ErrorCount)>();
+                var failedFileErrorCounts = new List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)>();
                 string? workUploadDir = null;
 
                 foreach (var file in remoteFailedFiles)
@@ -135,9 +136,9 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     result.NewFailedFiles.Add(file.Name);
                     _logger.LogInformation("Copied new failed file {FileName} to {LocalPath}", file.Name, localPath);
 
-                    var errorCount = CountDataRows(localPath);
+                    var errorRowNumbers = GetDataRowNumbers(localPath);
                     var normalizedFileName = NormalizeFileName(file.Name);
-                    failedFileErrorCounts.Add((normalizedFileName, errorCount));
+                    failedFileErrorCounts.Add((normalizedFileName, errorRowNumbers.Count, errorRowNumbers));
 
                     workUploadDir ??= GetTodaysWorkUploadFolder();
                     var workUploadPath = Path.Combine(workUploadDir, file.Name);
@@ -150,10 +151,11 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     await CreateReportAsync(connectionString, jobRunId, failedFileErrorCounts);
                 }
 
-                if (workUploadDir != null)
-                {
-                    OpenFolderInExplorer(workUploadDir);
-                }
+                workUploadDir ??= GetTodaysWorkUploadFolder();
+                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts);
+                _logger.LogInformation("Generated daily report file at {ReportFilePath}", reportFilePath);
+
+                OpenFolderInExplorer(workUploadDir);
             }
             finally
             {
@@ -210,21 +212,154 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         }
 
         /// <summary>
-        /// Counts data rows in a CSV file, excluding the header row.
+        /// Returns the 1-based data row numbers (excluding the header row) for every row in a CSV file.
+        /// Currently every data row is treated as an "error row" since these files come from the
+        /// SFTP "failed" directory. Row numbers are used for the report line, e.g. "(28,29,30)".
         /// </summary>
-        private static int CountDataRows(string filePath)
+        private static List<int> GetDataRowNumbers(string filePath)
         {
-            var lineCount = 0;
+            var rowNumbers = new List<int>();
             using var reader = new StreamReader(filePath);
+
+            var lineNumber = 0;
+            var dataRowNumber = 0;
             while (reader.ReadLine() != null)
             {
-                lineCount++;
+                lineNumber++;
+                if (lineNumber == 1)
+                {
+                    // Skip header row.
+                    continue;
+                }
+
+                dataRowNumber++;
+                rowNumbers.Add(dataRowNumber);
             }
 
-            return Math.Max(0, lineCount - 1);
+            return rowNumbers;
         }
 
-        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount)> failedFileErrorCounts)
+        /// <summary>
+        /// Generates (or appends to) today's plain-text morning report file, following the
+        /// team's standard "Pay Global Issues" template. Only the INT002 section is populated
+        /// dynamically from the sync results; the remaining sections are included as a static
+        /// scaffold to be filled in manually.
+        /// </summary>
+        private string GenerateDailyReportTextFile(
+            string workUploadDir,
+            DateTimeOffset runningAtUtc,
+            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
+        {
+            var reportDate = runningAtUtc.LocalDateTime;
+            var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
+            var reportFilePath = Path.Combine(workUploadDir, reportFileName);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("Pay Global Issues");
+            sb.AppendLine();
+            sb.AppendLine("INT002");
+            sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
+
+            AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts);
+            AppendInt002Line(sb, "NonManagerWorkerData", failedFileErrorCounts);
+            AppendInt002Line(sb, "ManagerWorkerData", failedFileErrorCounts);
+
+            sb.AppendLine();
+            if (failedFileErrorCounts.Count > 0)
+            {
+                sb.AppendLine("Action Taken: Error file(s) uploaded to :");
+                sb.AppendLine("  https://myobo365.sharepoint.com/:f:/r/sites/GSWorkdayPlatform/Integrations/PayGlobal/Error%20files%20%5Bto%20be%20checked%5D?csf=1&web=1&e=c2GefJ");
+            }
+            else
+            {
+                sb.AppendLine("Action Taken: No error files today.");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("INT003");
+            sb.AppendLine($" \u2666 Completed OK/Warning/Error on {FormatOrdinalDate(reportDate)}");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Banking Issues  ");
+            sb.AppendLine(" \u2666 Westpac/ANZ/CBA - (No retrieved documents found) as usual");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Acumatica Issues");
+            sb.AppendLine();
+            sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
+            sb.AppendLine(" \u2666 INT008 - Journals - COMPLETED  OK");
+            sb.AppendLine(" \u2666 INT024 - AHBT     - COMPLETED  OK");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("GTV, Prism, & Stripe Issues");
+            sb.AppendLine("GTV, Prism, & Stripe Issues | Failures / Error(s)");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine($"DLQ Recorded on {FormatOrdinalDate(reportDate)}");
+            sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue");
+            sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue-dlq  ");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("S3:");
+            sb.AppendLine(" \u2666 stripe-payout-workday-adapter-bucket - 0 FAILED 0 NEW  0 PROCESSED  ON - " + reportDate.ToString("dd-MM-yyyy"));
+            sb.AppendLine(" \u2666 phoenix-prd-prism-integration        - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+            sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Execute Data Change: PG_PayrollbyWorker_TBL SFTP DCT");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("DB");
+            sb.AppendLine(" \u2666 Stripe Latest completed - " + reportDate.ToString("dd-MM-yyyy HH:mm"));
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Miscellaneous Issues");
+            sb.AppendLine();
+            sb.AppendLine("XE");
+            sb.AppendLine(" \u2666 No issues reported.");
+            sb.AppendLine();
+            sb.AppendLine("Workday Community Updates:");
+            sb.AppendLine(" \u2666 No updates reported.");
+            sb.AppendLine();
+            sb.AppendLine();
+            sb.AppendLine("Items to Follow Up ");
+            sb.AppendLine(" \u2666 None.");
+
+            File.WriteAllText(reportFilePath, sb.ToString());
+            return reportFilePath;
+        }
+
+        private static void AppendInt002Line(
+            StringBuilder sb,
+            string itemName,
+            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
+        {
+            var match = failedFileErrorCounts.FirstOrDefault(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase));
+            var errorCount = match.NormalizedFileName != null ? match.ErrorCount : 0;
+            var rowNumbers = match.NormalizedFileName != null ? match.ErrorRowNumbers : new List<int>();
+
+            var errorWord = errorCount == 1 ? "Error" : "Errors";
+            var rowNumbersText = rowNumbers.Count > 0 ? $" ({string.Join(",", rowNumbers)})" : string.Empty;
+
+            sb.AppendLine($" \u2666{itemName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}");
+        }
+
+        private static string FormatOrdinalDate(DateTime date)
+        {
+            var day = date.Day;
+            var suffix = (day % 10, day / 10 % 10) switch
+            {
+                (1, not 1) => "st",
+                (2, not 1) => "nd",
+                (3, not 1) => "rd",
+                _ => "th"
+            };
+
+            return $"{day}{suffix} {date:MMMM}";
+        }
+
+        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers)> failedFileErrorCounts)
         {
             await using var connection = new SqlConnection(connectionString);
             await connection.OpenAsync();
@@ -247,10 +382,11 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
 
             var recordedOnUtc = DateTime.UtcNow;
 
-            foreach (var (normalizedFileName, errorCount) in failedFileErrorCounts)
+            foreach (var (normalizedFileName, errorCount, errorRowNumbers) in failedFileErrorCounts)
             {
                 var errorWord = errorCount == 1 ? "Error" : "Errors";
-                var lineText = $" \u2022{normalizedFileName,-22}- {errorCount} Data {errorWord}(s)";
+                var rowNumbersText = errorRowNumbers.Count > 0 ? $" ({string.Join(",", errorRowNumbers)})" : string.Empty;
+                var lineText = $" \u2022{normalizedFileName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}";
 
                 await using var lineCommand = new SqlCommand(insertReportLineSql, connection);
                 lineCommand.Parameters.AddWithValue("@ReportId", reportId);
