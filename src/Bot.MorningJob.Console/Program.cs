@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Bot.MorningJob.Console.Integrations.SFTP;
 using Bot.MorningJob.Console.Integrations.Int002;
 using Bot.MorningJob.Console.Integrations.Database;
+using Bot.MorningJob.Console.Integrations.Workday;
 using Serilog;
 using System.Reflection;
 
@@ -71,6 +72,7 @@ namespace Bot.MorningJob.Console
             // Register services
             services.AddScoped<ISftpService, SftpService>();
             services.AddScoped<IDatabaseService, DatabaseService>();
+            services.AddScoped<IWorkdayService, WorkdayService>();
             services.AddScoped<IInt002SyncService, Int002SyncService>();
 
             // Application service
@@ -208,6 +210,11 @@ namespace Bot.MorningJob.Console
         public string? BaseUrl { get; set; }
         public string? ClientId { get; set; }
         public string? ClientSecret { get; set; }
+        public string? RefreshToken { get; set; }
+        public string? TokenUrl { get; set; }
+        public string? ReportApiUrl { get; set; }
+        public string? MomentOffset { get; set; } = "-07:00";
+        public int LookbackHours { get; set; } = 24;
         public List<string>? IntegrationNames { get; set; }
     }
 

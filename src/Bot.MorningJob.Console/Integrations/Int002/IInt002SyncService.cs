@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using Bot.MorningJob.Console.Integrations.Database;
+using Bot.MorningJob.Console.Integrations.Workday;
 
 namespace Bot.MorningJob.Console.Integrations.Int002
 {
@@ -18,6 +19,21 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         public DateTime RunningAtUtc { get; set; }
         public List<string> NewProcessedFiles { get; set; } = new();
         public List<string> NewFailedFiles { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Data derived from the Workday RPT_INT059_SumoLogic_Integration_Logs report, used to
+    /// populate the INT003 and Acumatica Issues (INT008/INT024) sections of the daily report.
+    /// </summary>
+    public class WorkdayReportData
+    {
+        public string? Int003Status { get; set; }
+        public string? Int008Status { get; set; }
+        public string? Int008ReferenceRange { get; set; }
+        public string? Int024Status { get; set; }
+        public string? Int024ReferenceRange { get; set; }
+        public string? BankingStatus { get; set; }
+        public string? XeStatus { get; set; }
     }
 
     /// <summary>
@@ -40,6 +56,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private readonly ILogger<Int002SyncService> _logger;
         private readonly ISftpService _sftpService;
         private readonly IDatabaseService _databaseService;
+        private readonly IWorkdayService _workdayService;
         private readonly SftpSettings _sftpSettings;
         private readonly Int002SyncSettings _settings;
 
@@ -47,11 +64,13 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             ILogger<Int002SyncService> logger,
             ISftpService sftpService,
             IDatabaseService databaseService,
+            IWorkdayService workdayService,
             IOptions<AppSettings> appSettings)
         {
             _logger = logger;
             _sftpService = sftpService;
             _databaseService = databaseService;
+            _workdayService = workdayService;
             _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
             _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
         }
@@ -158,7 +177,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
                 workUploadDir ??= GetTodaysWorkUploadFolder();
                 var stripeLatestCompleted = await _databaseService.GetStripeLatestCompletedAsync();
-                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted);
+                var workdayReportData = await TryFetchWorkdayReportDataAsync(connectionString, runningAtUtc);
+                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData);
                 _logger.LogInformation("Generated daily report file at {ReportFilePath}", reportFilePath);
 
                 OpenFolderInExplorer(workUploadDir);
@@ -265,6 +285,211 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         }
 
         /// <summary>
+        /// Fetches Workday integration logs (INT003, INT008, INT024) for the last 24 hours,
+        /// persists them to SQL Server via IWorkdayService, and derives the report data used
+        /// for the INT003 and Acumatica Issues sections. Returns null if the fetch fails
+        /// (e.g. OAuth credentials invalid), so the report can gracefully fall back to a
+        /// static placeholder instead of failing the whole run.
+        /// </summary>
+        private async Task<WorkdayReportData?> TryFetchWorkdayReportDataAsync(string connectionString, DateTimeOffset runningAtUtc)
+        {
+            try
+            {
+                var toMoment = runningAtUtc;
+                var fromMoment = toMoment.AddHours(-24);
+
+                var entries = await _workdayService.FetchAndStoreIntegrationLogsAsync(connectionString, fromMoment, toMoment);
+
+                return new WorkdayReportData
+                {
+                    Int003Status = BuildStatusText(entries, "INT003_PayGlobal_Payroll_Journals_Inbound"),
+                    Int008Status = BuildStatusText(entries, "INT008_Acumatica_Billing_Journals_Inbound"),
+                    Int008ReferenceRange = BuildReferenceRange(entries, "INT008_Acumatica_Billing_Journals_Inbound"),
+                    Int024Status = BuildStatusText(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
+                    Int024ReferenceRange = BuildReferenceRange(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
+                    BankingStatus = BuildBankingStatus(entries),
+                    XeStatus = BuildXeStatus(entries)
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to fetch Workday integration logs for INT003/INT008/INT024 report sections.");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Picks the most recent log entry for the given integration and builds a human-friendly
+        /// status line, e.g. "COMPLETED  OK", "Completed with warning (no inbound file)".
+        /// </summary>
+        private static string? BuildStatusText(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName)
+        {
+            var latest = entries
+                .Where(e => string.Equals(e.IntegrationName, integrationName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(e => e.TimeStamp)
+                .FirstOrDefault();
+
+            if (latest == null)
+            {
+                return null;
+            }
+
+            var status = latest.Status ?? string.Empty;
+            var messages = latest.Messages ?? string.Empty;
+
+            if (status.Contains("Completed with Warning", StringComparison.OrdinalIgnoreCase))
+            {
+                if (messages.Contains("No inbound document found", StringComparison.OrdinalIgnoreCase) ||
+                    messages.Contains("No retrieved documents found", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "Completed with warning (no inbound file)";
+                }
+
+                return "Completed with warning";
+            }
+
+            if (status.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                status.Contains("Failed", StringComparison.OrdinalIgnoreCase))
+            {
+                return "COMPLETED  ERROR";
+            }
+
+            if (status.Contains("Completed", StringComparison.OrdinalIgnoreCase))
+            {
+                return "COMPLETED  OK";
+            }
+
+            return status;
+        }
+
+        /// <summary>
+        /// Extracts the Acumatica batch reference numbers (e.g. "Acumatica-1087-AU-AD-01") embedded
+        /// in the latest log entry's messages for the given integration, and formats them as a
+        /// range, e.g. "1087 - 1088". Returns null if no references are found.
+        /// </summary>
+        private static string? BuildReferenceRange(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName)
+        {
+            var latest = entries
+                .Where(e => string.Equals(e.IntegrationName, integrationName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(e => e.TimeStamp)
+                .FirstOrDefault();
+
+            if (latest?.Messages == null)
+            {
+                return null;
+            }
+
+            var matches = Regex.Matches(latest.Messages, @"Acumatica-(\d+)-");
+            var referenceNumbers = matches
+                .Select(m => int.Parse(m.Groups[1].Value))
+                .Distinct()
+                .OrderBy(n => n)
+                .ToList();
+
+            if (referenceNumbers.Count == 0)
+            {
+                return null;
+            }
+
+            return referenceNumbers.Count == 1
+                ? referenceNumbers[0].ToString()
+                : $"{referenceNumbers.First()} - {referenceNumbers.Last()}";
+        }
+
+        /// <summary>
+        /// Searches all Workday log entries whose process/integration name matches any of the
+        /// bank keywords (anz, cba, westpac, visa, common wealth) and determines the banking
+        /// status line. If every matching entry is "Completed with Warnings" (or better), the
+        /// usual "no retrieved documents found" line is returned. If any matching entry shows
+        /// "Completed With Errors" or a failed status, that status is surfaced with an
+        /// "**** Action required" marker.
+        /// </summary>
+        private static readonly string[] BankKeywords = { "anz", "cba", "westpac", "visa", "common wealth", "commonwealth" };
+
+        private static string BuildBankingStatus(List<Workday.WorkdayIntegrationLogEntry> entries)
+        {
+            var bankingEntries = entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.IntegrationName) &&
+                            BankKeywords.Any(k => e.IntegrationName!.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (bankingEntries.Count == 0)
+            {
+                return "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
+            }
+
+            var problemEntries = bankingEntries
+                .Where(e =>
+                {
+                    var status = e.Status ?? string.Empty;
+                    return status.Contains("Completed With Errors", StringComparison.OrdinalIgnoreCase) ||
+                           status.Contains("Completed with Errors", StringComparison.OrdinalIgnoreCase) ||
+                           status.Contains("Failed", StringComparison.OrdinalIgnoreCase) ||
+                           status.Contains("Error", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderByDescending(e => e.TimeStamp)
+                .ToList();
+
+            if (problemEntries.Count == 0)
+            {
+                return "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
+            }
+
+            var lines = problemEntries
+                .GroupBy(e => e.IntegrationName)
+                .Select(g => g.OrderByDescending(e => e.TimeStamp).First())
+                .Select(e => $"{e.IntegrationName} - {e.Status} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)} **** Action required");
+
+            return string.Join(Environment.NewLine + "  ", lines);
+        }
+
+        /// <summary>
+        /// Searches all Workday log entries whose process/integration name matches any of the
+        /// XE keywords (INT005 Studio XE Exchange Rates Inbound Preprocessor, INT005 XE Currency
+        /// Exchange Rates Inbound) and determines the XE status line. If every matching entry
+        /// completed without error or warning, "No issues reported." is returned. If any matching
+        /// entry shows an error, warning, or failed status, that status is surfaced with an
+        /// "**** Action required" marker.
+        /// </summary>
+        private static readonly string[] XeKeywords = { "XE Currency Exchange Rates Inbound", "Studio XE Exchange Rates Inbound Preprocessor" };
+
+        private static string BuildXeStatus(List<Workday.WorkdayIntegrationLogEntry> entries)
+        {
+            var xeEntries = entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.IntegrationName) &&
+                            XeKeywords.Any(k => e.IntegrationName!.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (xeEntries.Count == 0)
+            {
+                return "No issues reported.";
+            }
+
+            var problemEntries = xeEntries
+                .Where(e =>
+                {
+                    var status = e.Status ?? string.Empty;
+                    return status.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                           status.Contains("Warning", StringComparison.OrdinalIgnoreCase) ||
+                           status.Contains("Failed", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderByDescending(e => e.TimeStamp)
+                .ToList();
+
+            if (problemEntries.Count == 0)
+            {
+                return "No issues reported.";
+            }
+
+            var lines = problemEntries
+                .GroupBy(e => e.IntegrationName)
+                .Select(g => g.OrderByDescending(e => e.TimeStamp).First())
+                .Select(e => $"{e.IntegrationName} - {e.Status} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)} **** Action required");
+
+            return string.Join(Environment.NewLine + "  ", lines);
+        }
+
+        /// <summary>
         /// Generates (or appends to) today's plain-text morning report file, following the
         /// team's standard "Pay Global Issues" template. Only the INT002 section is populated
         /// dynamically from the sync results; the remaining sections are included as a static
@@ -274,7 +499,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             string workUploadDir,
             DateTimeOffset runningAtUtc,
             List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
-            DateTime? stripeLatestCompleted)
+            DateTime? stripeLatestCompleted,
+            WorkdayReportData? workdayReportData)
         {
             var reportDate = runningAtUtc.LocalDateTime;
             var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
@@ -305,18 +531,24 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("INT003");
-            sb.AppendLine($" \u2666 Completed --- | recorded on {FormatOrdinalDate(reportDate)}");
+            var int003StatusText = workdayReportData?.Int003Status ?? "Completed ---";
+            sb.AppendLine($" \u2666 {int003StatusText} | recorded on {FormatOrdinalDate(reportDate)}");
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine($"Banking Issues recorded on {FormatOrdinalDate(reportDate)}");
-            sb.AppendLine(" \u2666 Westpac/ANZ/CBA - (No retrieved documents found) as usual");
+            var bankingStatusText = workdayReportData?.BankingStatus ?? "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
+            sb.AppendLine($" \u2666 {bankingStatusText}");
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("Acumatica Issues");
             sb.AppendLine();
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
-            sb.AppendLine(" \u2666 INT008 - Journals - COMPLETED  OK");
-            sb.AppendLine(" \u2666 INT024 - AHBT     - COMPLETED  OK");
+            var int008StatusText = workdayReportData?.Int008Status ?? "COMPLETED  OK";
+            var int008RangeText = workdayReportData?.Int008ReferenceRange != null ? $" | {workdayReportData.Int008ReferenceRange}" : string.Empty;
+            sb.AppendLine($" \u2666 INT008 - Journals - {int008StatusText}{int008RangeText}");
+            var int024StatusText = workdayReportData?.Int024Status ?? "COMPLETED  OK";
+            var int024RangeText = workdayReportData?.Int024ReferenceRange != null ? $" | {workdayReportData.Int024ReferenceRange}" : string.Empty;
+            sb.AppendLine($" \u2666 INT024 - AHBT     - {int024StatusText}{int024RangeText}");
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("GTV, Prism, & Stripe Issues");
@@ -348,7 +580,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine("Miscellaneous Issues");
             sb.AppendLine();
             sb.AppendLine("XE");
-            sb.AppendLine(" \u2666 No issues reported.");
+            var xeStatusText = workdayReportData?.XeStatus ?? "No issues reported.";
+            sb.AppendLine($" \u2666 {xeStatusText}");
             sb.AppendLine();
             sb.AppendLine("Workday Community Updates:");
             sb.AppendLine(" \u2666 No updates reported.");
