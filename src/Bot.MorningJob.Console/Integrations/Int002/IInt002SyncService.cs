@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Bot.MorningJob.Console.Integrations.Database;
 using Bot.MorningJob.Console.Integrations.Workday;
+using Bot.MorningJob.Console.Integrations.Aws;
 
 namespace Bot.MorningJob.Console.Integrations.Int002
 {
@@ -57,22 +58,27 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private readonly ISftpService _sftpService;
         private readonly IDatabaseService _databaseService;
         private readonly IWorkdayService _workdayService;
+        private readonly IAwsService _awsService;
         private readonly SftpSettings _sftpSettings;
         private readonly Int002SyncSettings _settings;
+        private readonly AwsSettings _awsSettings;
 
         public Int002SyncService(
             ILogger<Int002SyncService> logger,
             ISftpService sftpService,
             IDatabaseService databaseService,
             IWorkdayService workdayService,
+            IAwsService awsService,
             IOptions<AppSettings> appSettings)
         {
             _logger = logger;
             _sftpService = sftpService;
             _databaseService = databaseService;
             _workdayService = workdayService;
+            _awsService = awsService;
             _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
             _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
+            _awsSettings = appSettings.Value.Aws ?? new AwsSettings();
         }
 
         public async Task<Int002SyncResult> SyncAsync()
@@ -178,7 +184,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 workUploadDir ??= GetTodaysWorkUploadFolder();
                 var stripeLatestCompleted = await _databaseService.GetStripeLatestCompletedAsync();
                 var workdayReportData = await TryFetchWorkdayReportDataAsync(connectionString, runningAtUtc);
-                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData);
+                var dlqStatusText = await TryFetchDlqStatusTextAsync();
+                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData, dlqStatusText);
                 _logger.LogInformation("Generated daily report file at {ReportFilePath}", reportFilePath);
 
                 OpenFolderInExplorer(workUploadDir);
@@ -316,6 +323,44 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 _logger.LogError(ex, "Failed to fetch Workday integration logs for INT003/INT008/INT024 report sections.");
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Assumes the configured AWS role (target-workday-integration-operations) and checks the
+        /// approximate message counts for the payout-transactions-queue and its DLQ. Returns the
+        /// "0 Messages on ..." lines when both queues are empty, or flags "**** Action required"
+        /// with the message count for any queue that has unprocessed messages. Returns null if the
+        /// AWS check fails (e.g. SSO/role not available), so the report can gracefully fall back
+        /// to a static placeholder instead of failing the whole run.
+        /// </summary>
+        private async Task<List<string>?> TryFetchDlqStatusTextAsync()
+        {
+            try
+            {
+                var queueName = string.IsNullOrWhiteSpace(_awsSettings.PayoutQueueName) ? "payout-transactions-queue" : _awsSettings.PayoutQueueName;
+                var dlqName = string.IsNullOrWhiteSpace(_awsSettings.PayoutDlqName) ? "payout-transactions-queue-dlq" : _awsSettings.PayoutDlqName;
+
+                var queueStatus = await _awsService.GetQueueMessageCountAsync(queueName);
+                var dlqStatus = await _awsService.GetQueueMessageCountAsync(dlqName);
+
+                return new List<string>
+                {
+                    BuildQueueStatusLine(queueStatus),
+                    BuildQueueStatusLine(dlqStatus)
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to fetch SQS queue message counts for the DLQ report section.");
+                return null;
+            }
+        }
+
+        private static string BuildQueueStatusLine(SqsQueueStatus status)
+        {
+            return status.ApproximateMessageCount == 0
+                ? $"0 Messages on {status.QueueName}"
+                : $"{status.ApproximateMessageCount} Messages on {status.QueueName} **** Action required";
         }
 
         /// <summary>
@@ -500,7 +545,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             DateTimeOffset runningAtUtc,
             List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
             DateTime? stripeLatestCompleted,
-            WorkdayReportData? workdayReportData)
+            WorkdayReportData? workdayReportData,
+            List<string>? dlqStatusText)
         {
             var reportDate = runningAtUtc.LocalDateTime;
             var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
@@ -556,8 +602,18 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine($"DLQ Recorded on {FormatOrdinalDate(reportDate)}");
-            sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue");
-            sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue-dlq  ");
+            if (dlqStatusText != null)
+            {
+                foreach (var line in dlqStatusText)
+                {
+                    sb.AppendLine($" \u2666 {line}");
+                }
+            }
+            else
+            {
+                sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue");
+                sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue-dlq  ");
+            }
             sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine("S3:");

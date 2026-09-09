@@ -73,6 +73,7 @@ namespace Bot.MorningJob.Console
             services.AddScoped<ISftpService, SftpService>();
             services.AddScoped<IDatabaseService, DatabaseService>();
             services.AddScoped<IWorkdayService, WorkdayService>();
+            services.AddScoped<Bot.MorningJob.Console.Integrations.Aws.IAwsService, Bot.MorningJob.Console.Integrations.Aws.AwsService>();
             services.AddScoped<IInt002SyncService, Int002SyncService>();
 
             // Application service
@@ -188,6 +189,11 @@ namespace Bot.MorningJob.Console
         public string? AccessKeyId { get; set; }
         public string? SecretAccessKey { get; set; }
         public string? Region { get; set; }
+        public string? SsoProfileName { get; set; } = "default";
+        public string? RoleArn { get; set; }
+        public string? RoleSessionName { get; set; } = "bot-morningjob-session";
+        public string? PayoutQueueName { get; set; } = "payout-transactions-queue";
+        public string? PayoutDlqName { get; set; } = "payout-transactions-queue-dlq";
         public S3Settings? S3 { get; set; }
         public SqsSettings? Sqs { get; set; }
     }
