@@ -59,6 +59,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private readonly IDatabaseService _databaseService;
         private readonly IWorkdayService _workdayService;
         private readonly IAwsService _awsService;
+        private readonly IS3BucketMonitorService _s3BucketMonitorService;
         private readonly SftpSettings _sftpSettings;
         private readonly Int002SyncSettings _settings;
         private readonly AwsSettings _awsSettings;
@@ -69,6 +70,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             IDatabaseService databaseService,
             IWorkdayService workdayService,
             IAwsService awsService,
+            IS3BucketMonitorService s3BucketMonitorService,
             IOptions<AppSettings> appSettings)
         {
             _logger = logger;
@@ -76,6 +78,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             _databaseService = databaseService;
             _workdayService = workdayService;
             _awsService = awsService;
+            _s3BucketMonitorService = s3BucketMonitorService;
             _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
             _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
             _awsSettings = appSettings.Value.Aws ?? new AwsSettings();
@@ -176,17 +179,23 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     _logger.LogInformation("Copied failed file {FileName} to manual upload folder {WorkUploadPath}", file.Name, workUploadPath);
                 }
 
-                if (failedFileErrorCounts.Count > 0)
-                {
-                    await CreateReportAsync(connectionString, jobRunId, failedFileErrorCounts);
-                }
-
                 workUploadDir ??= GetTodaysWorkUploadFolder();
                 var stripeLatestCompleted = await _databaseService.GetStripeLatestCompletedAsync();
                 var workdayReportData = await TryFetchWorkdayReportDataAsync(connectionString, runningAtUtc);
                 var dlqStatusText = await TryFetchDlqStatusTextAsync();
-                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData, dlqStatusText);
+                var s3BucketReportLines = await TryFetchS3BucketReportLinesAsync(connectionString, runningAtUtc);
+                var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData, dlqStatusText, s3BucketReportLines);
                 _logger.LogInformation("Generated daily report file at {ReportFilePath}", reportFilePath);
+
+                await CreateReportAsync(
+                    connectionString,
+                    jobRunId,
+                    runningAtUtc,
+                    failedFileErrorCounts,
+                    stripeLatestCompleted,
+                    workdayReportData,
+                    dlqStatusText,
+                    s3BucketReportLines);
 
                 OpenFolderInExplorer(workUploadDir);
             }
@@ -361,6 +370,61 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             return status.ApproximateMessageCount == 0
                 ? $"0 Messages on {status.QueueName}"
                 : $"{status.ApproximateMessageCount} Messages on {status.QueueName} **** Action required";
+        }
+
+        /// <summary>
+        /// Formats a scanned S3BucketReportLine into the standard report line format:
+        /// "{bucket} - {n} FAILED {n} NEW  {n} PROCESSED  ON - dd-MM-yyyy", appending
+        /// "**** Action required" if any failed/new items were detected, or "** no change" if
+        /// this line is just a repeat of an already-reported date with nothing new to report.
+        /// </summary>
+        private static string BuildS3BucketLineText(S3BucketReportLine line)
+        {
+            var baseText = $"{line.BucketName} - {line.FailedCount} FAILED {line.NewCount} NEW  {line.ProcessedCount} PROCESSED  ON - {line.ProcessedDate:dd-MM-yyyy}";
+
+            if (line.ActionRequired)
+            {
+                return $"{baseText} **** Action required";
+            }
+
+            if (line.IsAlreadyReported)
+            {
+                return $"{baseText} ** no change";
+            }
+
+            return baseText;
+        }
+
+        /// <summary>
+        /// Scans every bucket configured in AppSettings:Aws:MonitoredBuckets (failed/ new failures,
+        /// any "new" folder contents, and unreported processed/ dates), returning the report lines
+        /// for the S3 section. Each bucket is scanned independently; a failure scanning one bucket
+        /// does not prevent the others from being reported. Returns null only if no buckets are
+        /// configured at all, so the report can fall back to the static placeholder.
+        /// </summary>
+        private async Task<List<S3BucketReportLine>?> TryFetchS3BucketReportLinesAsync(string connectionString, DateTimeOffset runningAtUtc)
+        {
+            if (_awsSettings.MonitoredBuckets == null || _awsSettings.MonitoredBuckets.Count == 0)
+            {
+                return null;
+            }
+
+            var allLines = new List<S3BucketReportLine>();
+
+            foreach (var bucketConfig in _awsSettings.MonitoredBuckets)
+            {
+                try
+                {
+                    var lines = await _s3BucketMonitorService.ScanBucketAsync(bucketConfig, runningAtUtc.LocalDateTime, connectionString);
+                    allLines.AddRange(lines);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to scan S3 bucket {BucketName} for the S3 report section.", bucketConfig.BucketName);
+                }
+            }
+
+            return allLines;
         }
 
         /// <summary>
@@ -546,7 +610,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
             DateTime? stripeLatestCompleted,
             WorkdayReportData? workdayReportData,
-            List<string>? dlqStatusText)
+            List<string>? dlqStatusText,
+            List<S3BucketReportLine>? s3BucketReportLines)
         {
             var reportDate = runningAtUtc.LocalDateTime;
             var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
@@ -554,9 +619,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             var isMonday = reportDate.DayOfWeek == DayOfWeek.Monday;
 
             var sb = new StringBuilder();
-            sb.AppendLine("Pay Global Issues");
-            sb.AppendLine();
-            sb.AppendLine("INT002");
+            sb.AppendLine("*Pay Global Issues*");
+            sb.AppendLine("*INT002*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
 
             AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts, isMonday);
@@ -567,7 +631,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             if (failedFileErrorCounts.Count > 0)
             {
                 sb.AppendLine("Action Taken: Error file(s) uploaded to :");
-                sb.AppendLine("  https://myobo365.sharepoint.com/:f:/r/sites/GSWorkdayPlatform/Integrations/PayGlobal/Error%20files%20%5Bto%20be%20checked%5D?csf=1&web=1&e=c2GefJ");
+                sb.AppendLine("https://myobo365.sharepoint.com/:f:/r/sites/GSWorkdayPlatform/Integrations/PayGlobal/Error%20files%20%5Bto%20be%20checked%5D?csf=1&web=1&e=c2GefJ");
             }
             else
             {
@@ -575,19 +639,16 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             }
 
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("INT003");
+            sb.AppendLine("*INT003*");
             var int003StatusText = workdayReportData?.Int003Status ?? "Completed ---";
             sb.AppendLine($" \u2666 {int003StatusText} | recorded on {FormatOrdinalDate(reportDate)}");
             sb.AppendLine();
-            sb.AppendLine();
+            sb.AppendLine("*Banking Issues*");
             sb.AppendLine($"Banking Issues recorded on {FormatOrdinalDate(reportDate)}");
             var bankingStatusText = workdayReportData?.BankingStatus ?? "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
             sb.AppendLine($" \u2666 {bankingStatusText}");
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("Acumatica Issues");
-            sb.AppendLine();
+            sb.AppendLine("*Acumatica Issues*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
             var int008StatusText = workdayReportData?.Int008Status ?? "COMPLETED  OK";
             var int008RangeText = workdayReportData?.Int008ReferenceRange != null ? $" | {workdayReportData.Int008ReferenceRange}" : string.Empty;
@@ -596,10 +657,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             var int024RangeText = workdayReportData?.Int024ReferenceRange != null ? $" | {workdayReportData.Int024ReferenceRange}" : string.Empty;
             sb.AppendLine($" \u2666 INT024 - AHBT     - {int024StatusText}{int024RangeText}");
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("GTV, Prism, & Stripe Issues");
+            sb.AppendLine("*GTV, Prism, & Stripe Issues*");
             sb.AppendLine("GTV, Prism, & Stripe Issues | Failures / Error(s)");
-            sb.AppendLine();
             sb.AppendLine();
             sb.AppendLine($"DLQ Recorded on {FormatOrdinalDate(reportDate)}");
             if (dlqStatusText != null)
@@ -615,35 +674,40 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue-dlq  ");
             }
             sb.AppendLine();
-            sb.AppendLine();
             sb.AppendLine("S3:");
-            sb.AppendLine(" \u2666 stripe-payout-workday-adapter-bucket - 0 FAILED 0 NEW  0 PROCESSED  ON - " + reportDate.ToString("dd-MM-yyyy"));
-            sb.AppendLine(" \u2666 phoenix-prd-prism-integration        - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
-            sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+            if (s3BucketReportLines != null && s3BucketReportLines.Count > 0)
+            {
+                foreach (var bucketLine in s3BucketReportLines)
+                {
+                    sb.AppendLine($" \u2666 {BuildS3BucketLineText(bucketLine)}");
+                }
+            }
+            else
+            {
+                sb.AppendLine(" \u2666 stripe-payout-workday-adapter-bucket - 0 FAILED 0 NEW  0 PROCESSED  ON - " + reportDate.ToString("dd-MM-yyyy"));
+                sb.AppendLine(" \u2666 phoenix-prd-prism-integration        - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+                sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+            }
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("Sumo Logs");
+            sb.AppendLine("*Sumo Logs*");
             sb.AppendLine("Execute Data Change: PG_PayrollbyWorker_TBL SFTP DCT");
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine($"DB - Recorded on {FormatOrdinalDate(reportDate)}");
+            sb.AppendLine($"*DB* - Recorded on {FormatOrdinalDate(reportDate)}");
             var stripeLatestCompletedText = stripeLatestCompleted.HasValue
                 ? stripeLatestCompleted.Value.ToString("dd-MM-yyyy HH:mm")
                 : "Unavailable";
             sb.AppendLine($" \u2666 Stripe Latest completed - {stripeLatestCompletedText}");
             sb.AppendLine();
+            sb.AppendLine("*Miscellaneous Issues*");
             sb.AppendLine();
-            sb.AppendLine("Miscellaneous Issues");
-            sb.AppendLine();
-            sb.AppendLine("XE");
+            sb.AppendLine("*XE*");
             var xeStatusText = workdayReportData?.XeStatus ?? "No issues reported.";
             sb.AppendLine($" \u2666 {xeStatusText}");
             sb.AppendLine();
-            sb.AppendLine("Workday Community Updates:");
+            sb.AppendLine("*Workday Community Updates:*");
             sb.AppendLine(" \u2666 No updates reported.");
             sb.AppendLine();
-            sb.AppendLine();
-            sb.AppendLine("Items to Follow Up ");
+            sb.AppendLine("*Items to Follow Up*");
             sb.AppendLine(" \u2666 None.");
 
             File.WriteAllText(reportFilePath, sb.ToString());
@@ -686,7 +750,15 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             return $"{day}{suffix} {date:MMMM}";
         }
 
-        private static async Task CreateReportAsync(string connectionString, int jobRunId, List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts)
+        private async Task CreateReportAsync(
+            string connectionString,
+            int jobRunId,
+            DateTimeOffset runningAtUtc,
+            List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
+            DateTime? stripeLatestCompleted,
+            WorkdayReportData? workdayReportData,
+            List<string>? dlqStatusText,
+            List<S3BucketReportLine>? s3BucketReportLines)
         {
             await using var connection = new SqlConnection(connectionString);
             await connection.OpenAsync();
@@ -709,22 +781,88 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
 
             var recordedOnUtc = DateTime.UtcNow;
 
-            foreach (var (normalizedFileName, errorCount, errorRowNumbers, _) in failedFileErrorCounts)
+            async Task InsertLineAsync(string groupName, string integration, string itemName, int errorCount, string lineText)
             {
-                var errorWord = errorCount == 1 ? "Error" : "Errors";
-                var rowNumbersText = errorRowNumbers.Count > 0 ? $" ({string.Join(",", errorRowNumbers)})" : string.Empty;
-                var lineText = $" \u2022{normalizedFileName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}";
-
                 await using var lineCommand = new SqlCommand(insertReportLineSql, connection);
                 lineCommand.Parameters.AddWithValue("@ReportId", reportId);
-                lineCommand.Parameters.AddWithValue("@GroupName", "Pay Global Issues");
-                lineCommand.Parameters.AddWithValue("@Integration", IntegrationDisplayName);
-                lineCommand.Parameters.AddWithValue("@ItemName", normalizedFileName);
+                lineCommand.Parameters.AddWithValue("@GroupName", groupName);
+                lineCommand.Parameters.AddWithValue("@Integration", integration);
+                lineCommand.Parameters.AddWithValue("@ItemName", itemName);
                 lineCommand.Parameters.AddWithValue("@ErrorCount", errorCount);
                 lineCommand.Parameters.AddWithValue("@LineText", lineText);
                 lineCommand.Parameters.AddWithValue("@RecordedOn", recordedOnUtc);
                 await lineCommand.ExecuteNonQueryAsync();
             }
+
+            // INT002 (Pay Global Issues)
+            foreach (var (normalizedFileName, errorCount, errorRowNumbers, _) in failedFileErrorCounts)
+            {
+                var errorWord = errorCount == 1 ? "Error" : "Errors";
+                var rowNumbersText = errorRowNumbers.Count > 0 ? $" ({string.Join(",", errorRowNumbers)})" : string.Empty;
+                var lineText = $" \u2022{normalizedFileName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}";
+                await InsertLineAsync("Pay Global Issues", IntegrationDisplayName, normalizedFileName, errorCount, lineText);
+            }
+
+            // Ensure the three standard INT002 items are always represented, even with 0 errors,
+            // so the report history reflects a complete picture for every run.
+            foreach (var itemName in new[] { "SupervisoryOrgData", "NonManagerWorkerData", "ManagerWorkerData" })
+            {
+                if (!failedFileErrorCounts.Any(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    await InsertLineAsync("Pay Global Issues", IntegrationDisplayName, itemName, 0, $" \u2022{itemName,-22}- 0 Data Errors(s)");
+                }
+            }
+
+            // INT003
+            var int003StatusText = workdayReportData?.Int003Status ?? "Completed ---";
+            await InsertLineAsync("INT003", "INT003", "INT003", 0, int003StatusText);
+
+            // Banking Issues
+            var bankingStatusText = workdayReportData?.BankingStatus ?? "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
+            await InsertLineAsync("Banking Issues", "Banking", "Banking", 0, bankingStatusText);
+
+            // Acumatica Issues (INT008/INT024)
+            var int008StatusText = workdayReportData?.Int008Status ?? "COMPLETED  OK";
+            var int008RangeText = workdayReportData?.Int008ReferenceRange != null ? $" | {workdayReportData.Int008ReferenceRange}" : string.Empty;
+            await InsertLineAsync("Acumatica Issues", "INT008", "INT008 - Journals", 0, $"INT008 - Journals - {int008StatusText}{int008RangeText}");
+
+            var int024StatusText = workdayReportData?.Int024Status ?? "COMPLETED  OK";
+            var int024RangeText = workdayReportData?.Int024ReferenceRange != null ? $" | {workdayReportData.Int024ReferenceRange}" : string.Empty;
+            await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, $"INT024 - AHBT     - {int024StatusText}{int024RangeText}");
+
+            // DLQ
+            if (dlqStatusText != null)
+            {
+                foreach (var line in dlqStatusText)
+                {
+                    await InsertLineAsync("DLQ", "DLQ", "DLQ", 0, line);
+                }
+            }
+            else
+            {
+                await InsertLineAsync("DLQ", "DLQ", "DLQ", 0, "0 Messages on payout-transactions-queue");
+                await InsertLineAsync("DLQ", "DLQ", "DLQ", 0, "0 Messages on payout-transactions-queue-dlq");
+            }
+
+            // S3
+            if (s3BucketReportLines != null && s3BucketReportLines.Count > 0)
+            {
+                foreach (var bucketLine in s3BucketReportLines)
+                {
+                    var errorCount = bucketLine.FailedCount + bucketLine.NewCount;
+                    await InsertLineAsync("S3", bucketLine.BucketName ?? "S3", bucketLine.BucketName ?? "S3", errorCount, BuildS3BucketLineText(bucketLine));
+                }
+            }
+
+            // DB - Stripe latest completed
+            var stripeLatestCompletedText = stripeLatestCompleted.HasValue
+                ? stripeLatestCompleted.Value.ToString("dd-MM-yyyy HH:mm")
+                : "Unavailable";
+            await InsertLineAsync("DB", "Stripe", "Stripe Latest completed", 0, $"Stripe Latest completed - {stripeLatestCompletedText}");
+
+            // Miscellaneous Issues - XE
+            var xeStatusText = workdayReportData?.XeStatus ?? "No issues reported.";
+            await InsertLineAsync("Miscellaneous Issues", "XE", "XE", 0, xeStatusText);
         }
 
         private static async Task EnsureDatabaseAsync(string connectionString)

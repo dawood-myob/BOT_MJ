@@ -1,6 +1,8 @@
 using Amazon;
 using Amazon.SQS;
 using Amazon.SQS.Model;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Amazon.Runtime;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -19,31 +21,63 @@ namespace Bot.MorningJob.Console.Integrations.Aws
     }
 
     /// <summary>
-    /// AWS integration service. Assumes the target-workday-integration-operations role via
-    /// AWS SSO (same flow as the standalone AWSKeysUpg tool: aws sso login, then
-    /// aws sts assume-role), then queries SQS queue depths for the DLQ/GTV/Stripe report
-    /// section.
+    /// Result of checking connectivity/access to an S3 bucket that lives in another AWS
+    /// account, reached via a role assumed in that account.
+    /// </summary>
+    public class S3BucketStatus
+    {
+        public string? BucketName { get; set; }
+        public bool IsAccessible { get; set; }
+        public string? ErrorMessage { get; set; }
+    }
+
+    /// <summary>
+    /// AWS integration service. Assumes a target role via AWS SSO (same flow as the standalone
+    /// AWSKeysUpg tool: aws sso login, then aws sts assume-role), then queries SQS queue depths
+    /// and S3 bucket accessibility for the DLQ/GTV/Stripe report section. Each S3 bucket may live
+    /// in a different AWS account, so credentials are assumed per role ARN and cached.
     /// </summary>
     public interface IAwsService
     {
         /// <summary>
         /// Ensures AWS SSO credentials are available (logs in via "aws sso login" and assumes
-        /// the configured role via "aws sts assume-role" if needed), then returns AWS
-        /// credentials usable by the AWS SDK.
+        /// the given role via "aws sts assume-role" if not already cached for that role), then
+        /// returns AWS credentials usable by the AWS SDK.
         /// </summary>
-        Task<AWSCredentials> GetCredentialsAsync();
+        Task<AWSCredentials> GetCredentialsAsync(string roleArn);
 
         /// <summary>
-        /// Gets the approximate number of visible messages for the given queue name.
+        /// Gets the approximate number of visible messages for the given queue name, using the
+        /// role configured in AppSettings:Aws:RoleArn.
         /// </summary>
         Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName);
+
+        /// <summary>
+        /// Verifies connectivity/access to the given S3 bucket by assuming the given role and
+        /// performing a lightweight HeadBucket / ListObjectsV2 (MaxKeys=1) call.
+        /// </summary>
+        Task<S3BucketStatus> TestBucketConnectionAsync(string bucketName, string roleArn, string? region = null);
+
+        /// <summary>
+        /// Lists the immediate "folder" names (S3 CommonPrefixes) directly under the given prefix,
+        /// e.g. ListCommonPrefixesAsync(bucket, role, "failed/") returns ["2026/"], and
+        /// ListCommonPrefixesAsync(bucket, role, "failed/2026/") returns ["01/", "02/", ...].
+        /// </summary>
+        Task<List<string>> ListCommonPrefixesAsync(string bucketName, string roleArn, string prefix, string? region = null);
+
+        /// <summary>
+        /// Lists all objects (recursively, paginated) under the given prefix, e.g. every file
+        /// under "processed/2026/09/09/" or every file under "failed/".
+        /// </summary>
+        Task<List<Amazon.S3.Model.S3Object>> ListObjectsRecursiveAsync(string bucketName, string roleArn, string prefix, string? region = null);
     }
 
     public class AwsService : IAwsService
     {
         private readonly ILogger<AwsService> _logger;
         private readonly AwsSettings _settings;
-        private AWSCredentials? _cachedCredentials;
+        private readonly Dictionary<string, AWSCredentials> _cachedCredentialsByRole = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _ssoLoggedInProfiles = new(StringComparer.OrdinalIgnoreCase);
 
         public AwsService(ILogger<AwsService> logger, IOptions<AppSettings> appSettings)
         {
@@ -51,16 +85,14 @@ namespace Bot.MorningJob.Console.Integrations.Aws
             _settings = appSettings.Value.Aws ?? new AwsSettings();
         }
 
-        public async Task<AWSCredentials> GetCredentialsAsync()
+        public async Task<AWSCredentials> GetCredentialsAsync(string roleArn)
         {
-            if (_cachedCredentials != null)
+            if (_cachedCredentialsByRole.TryGetValue(roleArn, out var cached))
             {
-                return _cachedCredentials;
+                return cached;
             }
 
             var profileName = string.IsNullOrWhiteSpace(_settings.SsoProfileName) ? "default" : _settings.SsoProfileName;
-            var roleArn = _settings.RoleArn
-                ?? throw new InvalidOperationException("AppSettings:Aws:RoleArn is not configured.");
             var roleSessionName = string.IsNullOrWhiteSpace(_settings.RoleSessionName)
                 ? "bot-morningjob-session"
                 : _settings.RoleSessionName;
@@ -69,16 +101,25 @@ namespace Bot.MorningJob.Console.Integrations.Aws
 
             var (accessKeyId, secretAccessKey, sessionToken) = await AssumeRoleAsync(roleArn, roleSessionName, profileName);
 
-            _cachedCredentials = new SessionAWSCredentials(accessKeyId, secretAccessKey, sessionToken);
-            return _cachedCredentials;
+            var credentials = new SessionAWSCredentials(accessKeyId, secretAccessKey, sessionToken);
+            _cachedCredentialsByRole[roleArn] = credentials;
+            return credentials;
         }
 
         /// <summary>
         /// Runs "aws sso login --profile {profileName}". If the SSO session is already valid,
-        /// this typically returns immediately without prompting the browser.
+        /// this typically returns immediately without prompting the browser. The login is only
+        /// performed once per profile per process run (subsequent calls for the same profile,
+        /// e.g. when assuming multiple different roles, are skipped) to avoid opening multiple
+        /// browser tabs for what is really the same SSO session.
         /// </summary>
         private async Task EnsureSsoLoginAsync(string profileName)
         {
+            if (_ssoLoggedInProfiles.Contains(profileName))
+            {
+                return;
+            }
+
             var ssoLoginProcess = new ProcessStartInfo
             {
                 FileName = "aws",
@@ -103,6 +144,7 @@ namespace Bot.MorningJob.Console.Integrations.Aws
                 throw new InvalidOperationException($"AWS SSO login failed: {error}");
             }
 
+            _ssoLoggedInProfiles.Add(profileName);
             _logger.LogInformation("AWS SSO login successful. {Output}", output.Trim());
         }
 
@@ -154,7 +196,10 @@ namespace Bot.MorningJob.Console.Integrations.Aws
 
         public async Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName)
         {
-            var credentials = await GetCredentialsAsync();
+            var roleArn = _settings.RoleArn
+                ?? throw new InvalidOperationException("AppSettings:Aws:RoleArn is not configured.");
+
+            var credentials = await GetCredentialsAsync(roleArn);
             var region = string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region;
 
             using var sqsClient = new AmazonSQSClient(credentials, RegionEndpoint.GetBySystemName(region));
@@ -175,5 +220,100 @@ namespace Bot.MorningJob.Console.Integrations.Aws
                 ApproximateMessageCount = messageCount
             };
         }
+
+        public async Task<S3BucketStatus> TestBucketConnectionAsync(string bucketName, string roleArn, string? region = null)
+        {
+            try
+            {
+                var credentials = await GetCredentialsAsync(roleArn);
+                var effectiveRegion = string.IsNullOrWhiteSpace(region)
+                    ? (string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region)
+                    : region;
+
+                using var s3Client = new AmazonS3Client(credentials, RegionEndpoint.GetBySystemName(effectiveRegion));
+
+                await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+                {
+                    BucketName = bucketName,
+                    MaxKeys = 1
+                });
+
+                _logger.LogInformation("Connected to S3 bucket {BucketName} via role {RoleArn}.", bucketName, roleArn);
+
+                return new S3BucketStatus
+                {
+                    BucketName = bucketName,
+                    IsAccessible = true
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to connect to S3 bucket {BucketName} via role {RoleArn}.", bucketName, roleArn);
+                return new S3BucketStatus
+                {
+                    BucketName = bucketName,
+                    IsAccessible = false,
+                    ErrorMessage = ex.Message
+                };
+            }
+        }
+            public async Task<List<string>> ListCommonPrefixesAsync(string bucketName, string roleArn, string prefix, string? region = null)
+            {
+                var credentials = await GetCredentialsAsync(roleArn);
+                var effectiveRegion = string.IsNullOrWhiteSpace(region)
+                    ? (string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region)
+                    : region;
+
+                using var s3Client = new AmazonS3Client(credentials, RegionEndpoint.GetBySystemName(effectiveRegion));
+
+                var results = new List<string>();
+                string? continuationToken = null;
+
+                do
+                {
+                    var response = await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+                    {
+                        BucketName = bucketName,
+                        Prefix = prefix,
+                        Delimiter = "/",
+                        ContinuationToken = continuationToken
+                    });
+
+                    results.AddRange(response.CommonPrefixes);
+                    continuationToken = response.IsTruncated == true ? response.NextContinuationToken : null;
+                }
+                while (continuationToken != null);
+
+                return results;
+            }
+
+            public async Task<List<Amazon.S3.Model.S3Object>> ListObjectsRecursiveAsync(string bucketName, string roleArn, string prefix, string? region = null)
+            {
+                var credentials = await GetCredentialsAsync(roleArn);
+                var effectiveRegion = string.IsNullOrWhiteSpace(region)
+                    ? (string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region)
+                    : region;
+
+                using var s3Client = new AmazonS3Client(credentials, RegionEndpoint.GetBySystemName(effectiveRegion));
+
+                var results = new List<Amazon.S3.Model.S3Object>();
+                string? continuationToken = null;
+
+                do
+                {
+                    var response = await s3Client.ListObjectsV2Async(new ListObjectsV2Request
+                    {
+                        BucketName = bucketName,
+                        Prefix = prefix,
+                        ContinuationToken = continuationToken
+                    });
+
+                    results.AddRange(response.S3Objects);
+                    continuationToken = response.IsTruncated == true ? response.NextContinuationToken : null;
+                }
+                while (continuationToken != null);
+
+                return results;
+            }
+        }
     }
-}

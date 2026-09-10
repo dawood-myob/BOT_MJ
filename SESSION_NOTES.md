@@ -450,3 +450,76 @@ For questions about:
 
 **Last Updated**: 2026-07-23 - Initial Project Setup Complete
 **Next Update**: After .NET SDK installation and first build success
+
+---
+
+## Session Update: 2026-09-10 - S3 Bucket Monitoring, INT002 Report Logging & Formatting
+
+### Summary
+Implemented full S3 bucket monitoring for the three production buckets referenced in the
+morning report ("S3:" section), fixed report data being logged to SQL for only one section,
+and improved the daily report text file formatting for Slack.
+
+### ✅ S3 Bucket Monitoring (`IS3BucketMonitorService`)
+- Added `IS3BucketMonitorService` / `S3BucketMonitorService`, invoked from `Int002SyncService`
+  to populate the "S3:" section of the daily report.
+- Two scan modes, selected per-bucket via `S3BucketConfig.ScanMode`:
+  - **DateNested** (`stripe-payout-workday-adapter-bucket`): `failed/<yyyy>/<MM>/<dd>/`,
+    `processed/<yyyy>/<MM>/<dd>/`, and any `new` (case-insensitive) folder anywhere in the
+    bucket.
+  - **Flat** (`phoenix-prd-prism-integration`, `gt-transaction-prism-bucket`): a single
+    `Failed/`, `New/`, `Processed/` folder (case resolved dynamically against the bucket's
+    actual top-level prefixes); objects are grouped by S3 `LastModified` date since there are
+    no date sub-folders. Zero-byte "folder marker" objects are excluded from counts.
+- Scan state (known failed object keys, and which processed dates have already been reported)
+  is persisted in new SQL tables so re-running the job doesn't double-count or double-report:
+  `S3BucketFailedItems`, `S3BucketProcessedDates`, `S3BucketFlatReportDates`.
+- Supports multi-day backlog: if the job hasn't run in a few days, one report line is emitted
+  per unreported date, e.g.:
+  ```
+  ♦ phoenix-prd-prism-integration - 0 FAILED 1 NEW  0 PROCESSED  ON - 05-09-2026
+  ♦ phoenix-prd-prism-integration - 2 FAILED 1 NEW  2 PROCESSED  ON - 06-09-2026
+  ```
+- Report line rules:
+  - `**** Action required` appended when `FailedCount > 0 || NewCount > 0`.
+  - `** no change` appended when a bucket's most recent date was already reported previously
+    and there's nothing new (this also guarantees every configured bucket always appears in
+    the report — buckets are never silently dropped just because their latest date was
+    already recorded).
+
+### ✅ AWS SSO Login De-duplication (`IAwsService`)
+- `AwsService.GetCredentialsAsync` assumes a different IAM role per bucket/account (3 role
+  ARNs across 2 AWS accounts in this environment). Previously every distinct role ARN
+  triggered its own `aws sso login`, opening a separate browser tab per bucket even though
+  it's the same underlying SSO session/profile.
+- Added an in-memory `_ssoLoggedInProfiles` cache so `EnsureSsoLoginAsync` only performs the
+  actual `aws sso login` once per SSO profile per process run; `aws sts assume-role` still
+  runs per role ARN as before.
+
+### ✅ Full Report Section Logging to SQL (`ReportLines`)
+- Previously `CreateReportAsync` only ran (and only logged) the INT002/Pay Global Issues
+  section into `Reports`/`ReportLines`, so querying report history only showed INT002 data.
+- Rewrote `CreateReportAsync` to always run and log every section of the report: INT002 (Pay
+  Global Issues, including all three items even on 0-error days), INT003, Banking Issues,
+  Acumatica Issues (INT008/INT024), DLQ, S3, DB/Stripe latest completed, and Miscellaneous/XE.
+
+### ✅ Report Text File Formatting (Slack-friendly)
+- Added Slack `mrkdwn` bold section headers (`*Pay Global Issues*`, `*INT002*`,
+  `*Banking Issues*`, `*Acumatica Issues*`, `*GTV, Prism, & Stripe Issues*`, `*Sumo Logs*`,
+  `*DB*`, `*Miscellaneous Issues*`, `*XE*`, `*Workday Community Updates:*`,
+  `*Items to Follow Up*`) and tightened blank-line spacing, matching how the report is pasted
+  into the team's Slack channel.
+
+### Notes / Gotchas Learned This Session
+- Clearing SQL tracking tables (`Int002FailedFiles`, `Int002ProcessedFiles`,
+  `S3BucketFailedItems`, `S3BucketProcessedDates`, `S3BucketFlatReportDates`) resets the
+  "already seen" baseline, so the *next* run will treat all currently-existing SFTP/S3 files
+  as brand new. Useful for testing from a clean slate, but should be done deliberately (and
+  re-seeded with current file names, if simulating a normal day) rather than as part of
+  routine operation.
+- The `phoenix-prd-prism-integration` bucket uses capitalized top-level prefixes
+  (`Failed/`, `New/`, `Processed/`), not lowercase — folder names are resolved dynamically
+  by listing the bucket's actual top-level prefixes rather than assuming a fixed casing.
+
+**Last Updated**: 2026-09-10 - S3 bucket monitoring, SQL report logging, and Slack formatting complete
+

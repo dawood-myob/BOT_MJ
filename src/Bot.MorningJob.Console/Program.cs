@@ -74,6 +74,7 @@ namespace Bot.MorningJob.Console
             services.AddScoped<IDatabaseService, DatabaseService>();
             services.AddScoped<IWorkdayService, WorkdayService>();
             services.AddScoped<Bot.MorningJob.Console.Integrations.Aws.IAwsService, Bot.MorningJob.Console.Integrations.Aws.AwsService>();
+            services.AddScoped<Bot.MorningJob.Console.Integrations.Aws.IS3BucketMonitorService, Bot.MorningJob.Console.Integrations.Aws.S3BucketMonitorService>();
             services.AddScoped<IInt002SyncService, Int002SyncService>();
 
             // Application service
@@ -196,6 +197,29 @@ namespace Bot.MorningJob.Console
         public string? PayoutDlqName { get; set; } = "payout-transactions-queue-dlq";
         public S3Settings? S3 { get; set; }
         public SqsSettings? Sqs { get; set; }
+        public List<S3BucketConfig>? MonitoredBuckets { get; set; }
+    }
+
+    /// <summary>
+    /// Configuration for an S3 bucket that lives in a separate AWS account, accessed via a
+    /// dedicated cross-account role assumed through AWS SSO.
+    /// </summary>
+    public class S3BucketConfig
+    {
+        public string? BucketName { get; set; }
+        public string? RoleArn { get; set; }
+        public string? AccountId { get; set; }
+        public string? Region { get; set; }
+
+        /// <summary>
+        /// "DateNested" (default): failed/&lt;yyyy&gt;/&lt;MM&gt;/&lt;dd&gt;/ and
+        /// processed/&lt;yyyy&gt;/&lt;MM&gt;/&lt;dd&gt;/ sub-folder structure (e.g.
+        /// stripe-payout-workday-adapter-bucket).
+        /// "Flat": a single failed/, new/, and processed/ folder with no date sub-folders;
+        /// objects are grouped by their S3 LastModified date instead (e.g.
+        /// phoenix-prd-prism-integration).
+        /// </summary>
+        public string ScanMode { get; set; } = "DateNested";
     }
 
     public class S3Settings
