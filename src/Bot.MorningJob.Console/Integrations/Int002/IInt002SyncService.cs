@@ -39,7 +39,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         /// <summary>
         /// One line per distinct process/integration currently showing a "Failed" status in the
         /// Workday Sumo Logic integration log window, e.g.
-        /// "INT012_Some_Integration - Failed | recorded on 10th September **** Action required".
+        /// "INT012_Some_Integration - Failed | recorded on 10th September".
         /// Empty if no processes are currently failed.
         /// </summary>
         public List<string> SumoFailureLogLines { get; set; } = new();
@@ -612,7 +612,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         /// Searches every Workday Sumo Logic integration log entry in the fetched window for
         /// any process currently showing a "Failed" status (regardless of integration name),
         /// and builds one report line per distinct process, e.g.
-        /// "INT012_Some_Integration - Failed | recorded on 10th September **** Action required".
+        /// "INT012_Some_Integration - Failed | recorded on 10th September".
         /// Returns an empty list if no processes are currently failed.
         /// </summary>
         private static List<string> BuildSumoFailureLogLines(List<Workday.WorkdayIntegrationLogEntry> entries)
@@ -623,7 +623,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 .GroupBy(e => e.IntegrationName)
                 .Select(g => g.OrderByDescending(e => e.TimeStamp).First())
                 .OrderByDescending(e => e.TimeStamp)
-                .Select(e => $"{e.IntegrationName} - {e.Status} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)} **** Action required")
+                .Select(e => $"{e.IntegrationName} - {e.Status} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)}")
                 .ToList();
 
             return failedEntries;
