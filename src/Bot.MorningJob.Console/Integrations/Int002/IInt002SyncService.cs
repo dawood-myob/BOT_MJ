@@ -54,6 +54,16 @@ namespace Bot.MorningJob.Console.Integrations.Int002
     public interface IInt002SyncService
     {
         Task<Int002SyncResult> SyncAsync();
+
+        /// <summary>
+        /// Reverts everything created by the most recent job run: deletes the JobRun row and
+        /// all dependent rows (Int002 processed/failed files, Reports/ReportLines, Workday
+        /// integration log run/entries, and S3 bucket tracking rows recorded during that run),
+        /// and removes the corresponding local report/failed-file copies from the work upload
+        /// folder. Intended to be used to undo a run (e.g. a test run) so the next run behaves
+        /// like a genuine first run for that day.
+        /// </summary>
+        Task<bool> RollbackLastRunAsync();
     }
 
     public class Int002SyncService : IInt002SyncService
@@ -216,6 +226,107 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             return result;
         }
 
+        public async Task<bool> RollbackLastRunAsync()
+        {
+            var connectionString = _settings.SqlConnectionString
+                ?? throw new InvalidOperationException("AppSettings:Int002Sync:SqlConnectionString is not configured.");
+
+            await EnsureDatabaseAsync(connectionString);
+
+            var lastJobRun = await GetLastJobRunAsync(connectionString);
+            if (lastJobRun == null)
+            {
+                _logger.LogWarning("RollbackLastRunAsync: no JobRun rows found. Nothing to roll back.");
+                return false;
+            }
+
+            var (jobRunId, runningAtUtc) = lastJobRun.Value;
+            var localRunDate = new DateTimeOffset(runningAtUtc, TimeSpan.Zero).LocalDateTime;
+
+            _logger.LogInformation(
+                "Rolling back last run. JobRunId: {JobRunId}. RunningAtUtc: {RunningAtUtc}.",
+                jobRunId, runningAtUtc);
+
+            // Delete DB rows created by this job run, in dependency order.
+            await using (var connection = new SqlConnection(connectionString))
+            {
+                await connection.OpenAsync();
+
+                const string sql = @"
+DECLARE @ReportIds TABLE (ReportId INT);
+INSERT INTO @ReportIds (ReportId) SELECT ReportId FROM Reports WHERE JobRunId = @JobRunId;
+
+DELETE FROM ReportLines WHERE ReportId IN (SELECT ReportId FROM @ReportIds);
+DELETE FROM Reports WHERE JobRunId = @JobRunId;
+
+IF OBJECT_ID('WorkdayIntegrationLogRuns', 'U') IS NOT NULL
+BEGIN
+    DECLARE @RunIds TABLE (RunId INT);
+    INSERT INTO @RunIds (RunId)
+    SELECT RunId FROM WorkdayIntegrationLogRuns
+    WHERE FetchedAtUtc >= @RunningAtUtc AND FetchedAtUtc < DATEADD(MINUTE, 5, @RunningAtUtc);
+
+    DELETE FROM WorkdayIntegrationLogEntries WHERE RunId IN (SELECT RunId FROM @RunIds);
+    DELETE FROM WorkdayIntegrationLogRuns WHERE RunId IN (SELECT RunId FROM @RunIds);
+END
+
+DELETE FROM Int002FailedFiles WHERE JobRunId = @JobRunId;
+DELETE FROM Int002ProcessedFiles WHERE JobRunId = @JobRunId;
+
+IF OBJECT_ID('S3BucketProcessedDates', 'U') IS NOT NULL
+    DELETE FROM S3BucketProcessedDates WHERE RecordedAtUtc >= @RunningAtUtc AND RecordedAtUtc < DATEADD(MINUTE, 5, @RunningAtUtc);
+
+IF OBJECT_ID('S3BucketFlatReportDates', 'U') IS NOT NULL
+    DELETE FROM S3BucketFlatReportDates WHERE RecordedAtUtc >= @RunningAtUtc AND RecordedAtUtc < DATEADD(MINUTE, 5, @RunningAtUtc);
+
+IF OBJECT_ID('S3BucketFailedItems', 'U') IS NOT NULL
+    DELETE FROM S3BucketFailedItems WHERE DetectedAtUtc >= @RunningAtUtc AND DetectedAtUtc < DATEADD(MINUTE, 5, @RunningAtUtc);
+
+DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
+
+                await using var command = new SqlCommand(sql, connection);
+                command.Parameters.AddWithValue("@JobRunId", jobRunId);
+                command.Parameters.AddWithValue("@RunningAtUtc", runningAtUtc);
+                await command.ExecuteNonQueryAsync();
+            }
+
+            // Remove the generated report file and any failed files copied to the work upload
+            // folder for that run's local date.
+            var workUploadDir = GetWorkUploadFolderForDate(localRunDate);
+            if (Directory.Exists(workUploadDir))
+            {
+                var reportFileName = $"MorningJobReport_{localRunDate:dd-MM-yyyy}.txt";
+                var reportFilePath = Path.Combine(workUploadDir, reportFileName);
+                if (File.Exists(reportFilePath))
+                {
+                    File.Delete(reportFilePath);
+                    _logger.LogInformation("Deleted report file {ReportFilePath}.", reportFilePath);
+                }
+            }
+
+            _logger.LogInformation("Rollback complete for JobRunId {JobRunId}.", jobRunId);
+            return true;
+        }
+
+        private static async Task<(int JobRunId, DateTime RunningAtUtc)?> GetLastJobRunAsync(string connectionString)
+        {
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            const string sql = "SELECT TOP 1 JobRunId, RunningAt FROM JobRun ORDER BY JobRunId DESC";
+            await using var command = new SqlCommand(sql, connection);
+            await using var reader = await command.ExecuteReaderAsync();
+
+            if (!await reader.ReadAsync())
+            {
+                return null;
+            }
+
+            var jobRunId = reader.GetInt32(0);
+            var runningAt = reader.GetDateTime(1);
+            return (jobRunId, runningAt);
+        }
+
         /// <summary>
         /// Mirrors the existing manual batch script: builds (and creates if missing) a
         /// C:\work\yyyy\mm\dd folder for today's date, where new failed files are copied
@@ -223,12 +334,16 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         /// </summary>
         private string GetTodaysWorkUploadFolder()
         {
+            return GetWorkUploadFolderForDate(DateTime.Now);
+        }
+
+        private string GetWorkUploadFolderForDate(DateTime localDate)
+        {
             var workRoot = string.IsNullOrWhiteSpace(_settings.WorkUploadRootPath)
                 ? @"C:\work"
                 : _settings.WorkUploadRootPath;
 
-            var today = DateTime.Now;
-            var folder = Path.Combine(workRoot, today.ToString("yyyy"), today.ToString("MM"), today.ToString("dd"));
+            var folder = Path.Combine(workRoot, localDate.ToString("yyyy"), localDate.ToString("MM"), localDate.ToString("dd"));
             Directory.CreateDirectory(folder);
             return folder;
         }
@@ -745,7 +860,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             sb.AppendLine($" \u2666 {xeStatusText}");
             sb.AppendLine();
             sb.AppendLine("*Workday Community Updates:*");
-            sb.AppendLine(" \u2666 No updates reported.");
+            sb.AppendLine(" \u2666 No significant updates reported.");
             sb.AppendLine();
             sb.AppendLine("*Items to Follow Up*");
             sb.AppendLine(" \u2666 None.");

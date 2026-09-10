@@ -40,6 +40,16 @@ namespace Bot.MorningJob.Console
                 ConfigureServices(services, configuration);
                 var serviceProvider = services.BuildServiceProvider();
 
+                if (args.Any(a => string.Equals(a, "--rollback-last-run", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var int002SyncService = serviceProvider.GetRequiredService<IInt002SyncService>();
+                    var rolledBack = await int002SyncService.RollbackLastRunAsync();
+                    Log.Information(rolledBack
+                        ? "Rollback of last run completed successfully."
+                        : "Rollback of last run did not find any run to roll back.");
+                    return;
+                }
+
                 // Get the main application service
                 var app = serviceProvider.GetRequiredService<IApplicationService>();
                 await app.ExecuteAsync();
