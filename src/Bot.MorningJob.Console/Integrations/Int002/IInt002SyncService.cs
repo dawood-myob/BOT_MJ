@@ -35,7 +35,16 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         public string? Int024ReferenceRange { get; set; }
         public string? BankingStatus { get; set; }
         public string? XeStatus { get; set; }
+
+        /// <summary>
+        /// One line per distinct process/integration currently showing a "Failed" status in the
+        /// Workday Sumo Logic integration log window, e.g.
+        /// "INT012_Some_Integration - Failed | recorded on 10th September **** Action required".
+        /// Empty if no processes are currently failed.
+        /// </summary>
+        public List<string> SumoFailureLogLines { get; set; } = new();
     }
+
 
     /// <summary>
     /// Syncs INT002 processed/failed files from SFTP to a local folder structure
@@ -324,7 +333,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     Int024Status = BuildStatusText(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
                     Int024ReferenceRange = BuildReferenceRange(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
                     BankingStatus = BuildBankingStatus(entries),
-                    XeStatus = BuildXeStatus(entries)
+                    XeStatus = BuildXeStatus(entries),
+                    SumoFailureLogLines = BuildSumoFailureLogLines(entries)
                 };
             }
             catch (Exception ex)
@@ -599,10 +609,29 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         }
 
         /// <summary>
+        /// Searches every Workday Sumo Logic integration log entry in the fetched window for
+        /// any process currently showing a "Failed" status (regardless of integration name),
+        /// and builds one report line per distinct process, e.g.
+        /// "INT012_Some_Integration - Failed | recorded on 10th September **** Action required".
+        /// Returns an empty list if no processes are currently failed.
+        /// </summary>
+        private static List<string> BuildSumoFailureLogLines(List<Workday.WorkdayIntegrationLogEntry> entries)
+        {
+            var failedEntries = entries
+                .Where(e => !string.IsNullOrWhiteSpace(e.Status) &&
+                            e.Status!.Contains("Failed", StringComparison.OrdinalIgnoreCase))
+                .GroupBy(e => e.IntegrationName)
+                .Select(g => g.OrderByDescending(e => e.TimeStamp).First())
+                .OrderByDescending(e => e.TimeStamp)
+                .Select(e => $"{e.IntegrationName} - {e.Status} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)} **** Action required")
+                .ToList();
+
+            return failedEntries;
+        }
+
+        /// <summary>
         /// Generates (or appends to) today's plain-text morning report file, following the
-        /// team's standard "Pay Global Issues" template. Only the INT002 section is populated
-        /// dynamically from the sync results; the remaining sections are included as a static
-        /// scaffold to be filled in manually.
+        /// team's standard "Pay Global Issues" template.
         /// </summary>
         private string GenerateDailyReportTextFile(
             string workUploadDir,
@@ -689,8 +718,19 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                 sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
             }
             sb.AppendLine();
-            sb.AppendLine("*Sumo Logs*");
-            sb.AppendLine("Execute Data Change: PG_PayrollbyWorker_TBL SFTP DCT");
+            sb.AppendLine("*Sumo Failure Logs*");
+            var sumoFailureLogLines = workdayReportData?.SumoFailureLogLines;
+            if (sumoFailureLogLines != null && sumoFailureLogLines.Count > 0)
+            {
+                foreach (var line in sumoFailureLogLines)
+                {
+                    sb.AppendLine($" \u2666 {line}");
+                }
+            }
+            else
+            {
+                sb.AppendLine(" \u2666 No failed processes reported.");
+            }
             sb.AppendLine();
             sb.AppendLine($"*DB* - Recorded on {FormatOrdinalDate(reportDate)}");
             var stripeLatestCompletedText = stripeLatestCompleted.HasValue
@@ -852,6 +892,20 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
                     var errorCount = bucketLine.FailedCount + bucketLine.NewCount;
                     await InsertLineAsync("S3", bucketLine.BucketName ?? "S3", bucketLine.BucketName ?? "S3", errorCount, BuildS3BucketLineText(bucketLine));
                 }
+            }
+
+            // Sumo Failure Logs
+            var sumoFailureLogLines = workdayReportData?.SumoFailureLogLines;
+            if (sumoFailureLogLines != null && sumoFailureLogLines.Count > 0)
+            {
+                foreach (var line in sumoFailureLogLines)
+                {
+                    await InsertLineAsync("Sumo Failure Logs", "Sumo", "Sumo", 1, line);
+                }
+            }
+            else
+            {
+                await InsertLineAsync("Sumo Failure Logs", "Sumo", "Sumo", 0, "No failed processes reported.");
             }
 
             // DB - Stripe latest completed
