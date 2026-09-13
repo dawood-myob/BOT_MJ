@@ -465,7 +465,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
                 {
                     Int003Lines = BuildInt003Lines(entries, "INT003_PayGlobal_Payroll_Journals_Inbound"),
                     Int008Lines = BuildAcumaticaLines(entries, "INT008_Acumatica_Billing_Journals_Inbound", "INT008 - Journals"),
-                    Int024Lines = BuildAcumaticaLines(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound", "INT024 - AHBT    "),
+                    Int024Lines = BuildAcumaticaLines(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound", "INT024 - AHBT"),
                     BankingStatus = BuildBankingStatus(entries),
                     XeStatus = BuildXeStatus(entries),
                     SumoFailureLogLines = BuildSumoFailureLogLines(entries)
@@ -902,7 +902,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             }
             else
             {
-                sb.AppendLine(" \u2666 INT024 - AHBT     - COMPLETED  OK");
+                sb.AppendLine(" \u2666 INT024 - AHBT - COMPLETED  OK");
             }
             sb.AppendLine();
             sb.AppendLine("*GTV, Prism, & Stripe Issues*");
@@ -1139,7 +1139,7 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
             }
             else
             {
-                await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, "INT024 - AHBT     - COMPLETED  OK");
+                await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, "INT024 - AHBT - COMPLETED  OK");
             }
 
             // DLQ
