@@ -28,11 +28,25 @@ namespace Bot.MorningJob.Console.Integrations.Int002
     /// </summary>
     public class WorkdayReportData
     {
-        public string? Int003Status { get; set; }
-        public string? Int008Status { get; set; }
-        public string? Int008ReferenceRange { get; set; }
-        public string? Int024Status { get; set; }
-        public string? Int024ReferenceRange { get; set; }
+        /// <summary>
+        /// One formatted line per INT003 run recorded since the previous job execution, e.g.
+        /// "Completed with warning | recorded on 11th September". Empty if no runs were found.
+        /// </summary>
+        public List<string> Int003Lines { get; set; } = new();
+
+        /// <summary>
+        /// One formatted line per INT008 (Acumatica Journals) run recorded since the previous
+        /// job execution, e.g. "INT008 - Journals - COMPLETED OK | 1093 - 1094 | recorded on 11th September".
+        /// Empty if no runs were found.
+        /// </summary>
+        public List<string> Int008Lines { get; set; } = new();
+
+        /// <summary>
+        /// One formatted line per INT024 (AHBT) run recorded since the previous job execution.
+        /// Empty if no runs were found.
+        /// </summary>
+        public List<string> Int024Lines { get; set; } = new();
+
         public string? BankingStatus { get; set; }
         public string? XeStatus { get; set; }
 
@@ -119,6 +133,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
             await EnsureDatabaseAsync(connectionString);
 
+            var previousJobRun = await GetLastJobRunAsync(connectionString);
+
             var runningAtUtc = DateTime.UtcNow;
             var jobRunId = await InsertJobRunAsync(connectionString, runningAtUtc);
 
@@ -200,7 +216,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
                 workUploadDir ??= GetTodaysWorkUploadFolder();
                 var stripeLatestCompleted = await _databaseService.GetStripeLatestCompletedAsync();
-                var workdayReportData = await TryFetchWorkdayReportDataAsync(connectionString, runningAtUtc);
+                var workdayReportData = await TryFetchWorkdayReportDataAsync(connectionString, runningAtUtc, previousJobRun?.RunningAtUtc);
                 var dlqStatusText = await TryFetchDlqStatusTextAsync();
                 var s3BucketReportLines = await TryFetchS3BucketReportLinesAsync(connectionString, runningAtUtc);
                 var reportFilePath = GenerateDailyReportTextFile(workUploadDir, runningAtUtc, failedFileErrorCounts, stripeLatestCompleted, workdayReportData, dlqStatusText, s3BucketReportLines);
@@ -425,28 +441,31 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
         }
 
         /// <summary>
-        /// Fetches Workday integration logs (INT003, INT008, INT024) for the last 24 hours,
-        /// persists them to SQL Server via IWorkdayService, and derives the report data used
-        /// for the INT003 and Acumatica Issues sections. Returns null if the fetch fails
+        /// Fetches Workday integration logs (INT003, INT008, INT024) since the previous job run
+        /// (or the last 24 hours if this is the first run / no previous run is found), persists
+        /// them to SQL Server via IWorkdayService, and derives the report data used for the
+        /// INT003 and Acumatica Issues sections. Using the previous run's timestamp (rather than
+        /// a fixed 24-hour window) ensures no entries are missed if the job didn't run on the
+        /// previous day(s), e.g. weekends or a skipped run. Returns null if the fetch fails
         /// (e.g. OAuth credentials invalid), so the report can gracefully fall back to a
         /// static placeholder instead of failing the whole run.
         /// </summary>
-        private async Task<WorkdayReportData?> TryFetchWorkdayReportDataAsync(string connectionString, DateTimeOffset runningAtUtc)
+        private async Task<WorkdayReportData?> TryFetchWorkdayReportDataAsync(string connectionString, DateTimeOffset runningAtUtc, DateTime? previousRunningAtUtc)
         {
             try
             {
                 var toMoment = runningAtUtc;
-                var fromMoment = toMoment.AddHours(-24);
+                var fromMoment = previousRunningAtUtc.HasValue
+                    ? new DateTimeOffset(previousRunningAtUtc.Value, TimeSpan.Zero)
+                    : toMoment.AddHours(-24);
 
                 var entries = await _workdayService.FetchAndStoreIntegrationLogsAsync(connectionString, fromMoment, toMoment);
 
                 return new WorkdayReportData
                 {
-                    Int003Status = BuildStatusText(entries, "INT003_PayGlobal_Payroll_Journals_Inbound"),
-                    Int008Status = BuildStatusText(entries, "INT008_Acumatica_Billing_Journals_Inbound"),
-                    Int008ReferenceRange = BuildReferenceRange(entries, "INT008_Acumatica_Billing_Journals_Inbound"),
-                    Int024Status = BuildStatusText(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
-                    Int024ReferenceRange = BuildReferenceRange(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound"),
+                    Int003Lines = BuildInt003Lines(entries, "INT003_PayGlobal_Payroll_Journals_Inbound"),
+                    Int008Lines = BuildAcumaticaLines(entries, "INT008_Acumatica_Billing_Journals_Inbound", "INT008 - Journals"),
+                    Int024Lines = BuildAcumaticaLines(entries, "INT024_Acumatica_to_Workday_AHBT_Inbound", "INT024 - AHBT    "),
                     BankingStatus = BuildBankingStatus(entries),
                     XeStatus = BuildXeStatus(entries),
                     SumoFailureLogLines = BuildSumoFailureLogLines(entries)
@@ -553,32 +572,16 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
         }
 
         /// <summary>
-        /// Picks the most recent log entry for the given integration and builds a human-friendly
-        /// status line, e.g. "COMPLETED  OK", "Completed with warning (no inbound file)".
+        /// Converts a raw Workday status/messages pair into a human-friendly status label, e.g.
+        /// "COMPLETED  OK", "Completed with warning (no inbound file)".
         /// </summary>
-        private static string? BuildStatusText(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName)
+        private static string BuildStatusLabel(string? rawStatus, string? rawMessages)
         {
-            var latest = entries
-                .Where(e => string.Equals(e.IntegrationName, integrationName, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(e => e.TimeStamp)
-                .FirstOrDefault();
-
-            if (latest == null)
-            {
-                return null;
-            }
-
-            var status = latest.Status ?? string.Empty;
-            var messages = latest.Messages ?? string.Empty;
+            var status = rawStatus ?? string.Empty;
+            var messages = rawMessages ?? string.Empty;
 
             if (status.Contains("Completed with Warning", StringComparison.OrdinalIgnoreCase))
             {
-                if (messages.Contains("No inbound document found", StringComparison.OrdinalIgnoreCase) ||
-                    messages.Contains("No retrieved documents found", StringComparison.OrdinalIgnoreCase))
-                {
-                    return "Completed with warning (no inbound file)";
-                }
-
                 return "Completed with warning";
             }
 
@@ -597,23 +600,95 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
         }
 
         /// <summary>
-        /// Extracts the Acumatica batch reference numbers (e.g. "Acumatica-1087-AU-AD-01") embedded
-        /// in the latest log entry's messages for the given integration, and formats them as a
-        /// range, e.g. "1087 - 1088". Returns null if no references are found.
+        /// Builds one formatted line per log entry for the given integration, in chronological
+        /// order (oldest first), e.g. "Completed with warning | known warning no inbound document
+        /// | recorded on 13th September". Ensures every run since the previous job execution is
+        /// reported, rather than only the most recent one, so runs are not silently dropped when
+        /// an integration runs more than once between job executions (e.g. across a weekend).
         /// </summary>
-        private static string? BuildReferenceRange(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName)
+        private static List<string> BuildInt003Lines(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName)
         {
-            var latest = entries
+            return entries
                 .Where(e => string.Equals(e.IntegrationName, integrationName, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(e => e.TimeStamp)
-                .FirstOrDefault();
+                .OrderBy(e => e.TimeStamp)
+                .Select(e =>
+                {
+                    var statusText = BuildStatusLabel(e.Status, e.Messages);
+                    var warningNoteText = BuildWarningNote(statusText, e.Messages);
+                    return $"{statusText}{warningNoteText} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)}";
+                })
+                .ToList();
+        }
 
-            if (latest?.Messages == null)
+        /// <summary>
+        /// Builds one formatted line per log entry for the given Acumatica integration (INT008 or
+        /// INT024), in chronological order (oldest first), including the batch reference numbers
+        /// (e.g. "Acumatica-1087-AU-AD-01") extracted from that run's messages, formatted as a
+        /// range. Ensures every run since the previous job execution is reported, rather than only
+        /// the most recent one. If the run completed with a warning, the messages are checked for
+        /// the known "Contains Control Account" pattern; if found, the line is annotated with
+        /// "known warning of Contains Control Account" (no action needed), otherwise with
+        /// "*** Action Needed" so unrecognized warnings are still flagged for follow-up.
+        /// </summary>
+        private static List<string> BuildAcumaticaLines(List<Workday.WorkdayIntegrationLogEntry> entries, string integrationName, string label)
+        {
+            return entries
+                .Where(e => string.Equals(e.IntegrationName, integrationName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(e => e.TimeStamp)
+                .Select(e =>
+                {
+                    var statusText = BuildStatusLabel(e.Status, e.Messages);
+                    var referenceRange = BuildReferenceRange(e.Messages);
+                    var rangeText = referenceRange != null ? $" | {referenceRange}" : string.Empty;
+                    var warningNoteText = BuildWarningNote(statusText, e.Messages);
+                    return $"{label} - {statusText}{rangeText}{warningNoteText} | recorded on {FormatOrdinalDate(e.TimeStamp.LocalDateTime)}";
+                })
+                .ToList();
+        }
+
+        /// <summary>
+        /// If the given status text indicates a warning, checks the run's messages for the known
+        /// "Contains Control Account" pattern and returns an annotation noting it's a known
+        /// warning (no action needed), or "*** Action Needed" if the warning cause is not
+        /// recognized. Returns an empty string for non-warning statuses.
+        /// </summary>
+        private static string BuildWarningNote(string statusText, string? messages)
+        {
+            if (!statusText.Contains("warning", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Empty;
+            }
+
+            if (!string.IsNullOrEmpty(messages) &&
+                messages.Contains("Contains Control Account", StringComparison.OrdinalIgnoreCase))
+            {
+                return " | known warning Control Account";
+            }
+
+            if (!string.IsNullOrEmpty(messages) &&
+                (messages.Contains("No inbound document found", StringComparison.OrdinalIgnoreCase) ||
+                 messages.Contains("No inbound documents found", StringComparison.OrdinalIgnoreCase) ||
+                 messages.Contains("No retrieved documents found", StringComparison.OrdinalIgnoreCase)))
+            {
+                return " | known warning no inbound document";
+            }
+
+            return " | *** Action Needed";
+        }
+
+        /// <summary>
+        /// Extracts the Acumatica batch reference numbers (e.g. "Acumatica-1087-AU-AD-01") embedded
+        /// in a log entry's messages and formats them as a range, e.g. "1087 - 1088". Returns null
+        /// if no references are found.
+        /// </summary>
+        private static string? BuildReferenceRange(string? messages)
+        {
+            if (string.IsNullOrEmpty(messages))
             {
                 return null;
             }
 
-            var matches = Regex.Matches(latest.Messages, @"Acumatica-(\d+)-");
+            var matches = Regex.Matches(messages, @"Acumatica-(\d+)-");
             var referenceNumbers = matches
                 .Select(m => int.Parse(m.Groups[1].Value))
                 .Distinct()
@@ -784,8 +859,18 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
 
             sb.AppendLine();
             sb.AppendLine("*INT003*");
-            var int003StatusText = workdayReportData?.Int003Status ?? "Completed ---";
-            sb.AppendLine($" \u2666 {int003StatusText} | recorded on {FormatOrdinalDate(reportDate)}");
+            var int003Lines = workdayReportData?.Int003Lines;
+            if (int003Lines != null && int003Lines.Count > 0)
+            {
+                foreach (var line in int003Lines)
+                {
+                    sb.AppendLine($" \u2666 {line}");
+                }
+            }
+            else
+            {
+                sb.AppendLine($" \u2666 Completed --- | recorded on {FormatOrdinalDate(reportDate)}");
+            }
             sb.AppendLine();
             sb.AppendLine("*Banking Issues*");
             sb.AppendLine($"Banking Issues recorded on {FormatOrdinalDate(reportDate)}");
@@ -794,12 +879,31 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             sb.AppendLine();
             sb.AppendLine("*Acumatica Issues*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
-            var int008StatusText = workdayReportData?.Int008Status ?? "COMPLETED  OK";
-            var int008RangeText = workdayReportData?.Int008ReferenceRange != null ? $" | {workdayReportData.Int008ReferenceRange}" : string.Empty;
-            sb.AppendLine($" \u2666 INT008 - Journals - {int008StatusText}{int008RangeText}");
-            var int024StatusText = workdayReportData?.Int024Status ?? "COMPLETED  OK";
-            var int024RangeText = workdayReportData?.Int024ReferenceRange != null ? $" | {workdayReportData.Int024ReferenceRange}" : string.Empty;
-            sb.AppendLine($" \u2666 INT024 - AHBT     - {int024StatusText}{int024RangeText}");
+            var int008Lines = workdayReportData?.Int008Lines;
+            if (int008Lines != null && int008Lines.Count > 0)
+            {
+                foreach (var line in int008Lines)
+                {
+                    sb.AppendLine($" \u2666 {line}");
+                }
+            }
+            else
+            {
+                sb.AppendLine(" \u2666 INT008 - Journals - COMPLETED  OK");
+            }
+            sb.AppendLine();
+            var int024Lines = workdayReportData?.Int024Lines;
+            if (int024Lines != null && int024Lines.Count > 0)
+            {
+                foreach (var line in int024Lines)
+                {
+                    sb.AppendLine($" \u2666 {line}");
+                }
+            }
+            else
+            {
+                sb.AppendLine(" \u2666 INT024 - AHBT     - COMPLETED  OK");
+            }
             sb.AppendLine();
             sb.AppendLine("*GTV, Prism, & Stripe Issues*");
             sb.AppendLine("GTV, Prism, & Stripe Issues | Failures / Error(s)");
@@ -821,9 +925,17 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             sb.AppendLine("S3:");
             if (s3BucketReportLines != null && s3BucketReportLines.Count > 0)
             {
+                string? previousBucketName = null;
                 foreach (var bucketLine in s3BucketReportLines)
                 {
+                    if (previousBucketName != null &&
+                        !string.Equals(previousBucketName, bucketLine.BucketName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        sb.AppendLine();
+                    }
+
                     sb.AppendLine($" \u2666 {BuildS3BucketLineText(bucketLine)}");
+                    previousBucketName = bucketLine.BucketName;
                 }
             }
             else
@@ -875,20 +987,37 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
             bool isMonday)
         {
-            var match = failedFileErrorCounts.FirstOrDefault(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase));
-            var errorCount = match.NormalizedFileName != null ? match.ErrorCount : 0;
-            var rowNumbers = match.NormalizedFileName != null ? match.ErrorRowNumbers : new List<int>();
+            var matches = failedFileErrorCounts
+                .Where(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f.FileDate)
+                .ToList();
 
-            var errorWord = errorCount == 1 ? "Error" : "Errors";
+            if (matches.Count == 0)
+            {
+                sb.AppendLine($" \u2666{itemName,-22}- 0 Data Errors(s)");
+                return;
+            }
 
-            // Monday runs may see a backlog of Saturday/Sunday files in the SFTP failed folder,
-            // so the row numbers are annotated with the specific file date. Tuesday-Friday runs
-            // only ever contain the previous day's file, so the row-number detail is omitted.
-            var rowNumbersText = isMonday && rowNumbers.Count > 0
-                ? $" ({string.Join(",", rowNumbers)}{(match.FileDate.HasValue ? $" - {match.FileDate.Value:dd-MM-yyyy}" : string.Empty)})"
-                : string.Empty;
+            // Monday runs may see a backlog of Saturday/Sunday/Friday files in the SFTP failed
+            // folder, so every matching file for this item gets its own line, annotated with the
+            // specific file date. Tuesday-Friday runs only ever contain the previous day's file,
+            // so the row-number/date detail is omitted and a single combined line is emitted.
+            if (isMonday)
+            {
+                foreach (var match in matches)
+                {
+                    var errorWord = match.ErrorCount == 1 ? "Error" : "Errors";
+                    var dateText = match.FileDate.HasValue ? $" ({match.FileDate.Value:dd-MM-yyyy})" : string.Empty;
 
-            sb.AppendLine($" \u2666{itemName,-22}- {errorCount} Data {errorWord}(s){rowNumbersText}");
+                    sb.AppendLine($" \u2666{itemName,-22}- {match.ErrorCount} Data {errorWord}(s){dateText}");
+                }
+            }
+            else
+            {
+                var errorCount = matches.Sum(m => m.ErrorCount);
+                var errorWord = errorCount == 1 ? "Error" : "Errors";
+                sb.AppendLine($" \u2666{itemName,-22}- {errorCount} Data {errorWord}(s)");
+            }
         }
 
         private static string FormatOrdinalDate(DateTime date)
@@ -969,21 +1098,49 @@ VALUES (@ReportId, @GroupName, @Integration, @ItemName, @ErrorCount, @LineText, 
             }
 
             // INT003
-            var int003StatusText = workdayReportData?.Int003Status ?? "Completed ---";
-            await InsertLineAsync("INT003", "INT003", "INT003", 0, int003StatusText);
+            var int003Lines = workdayReportData?.Int003Lines;
+            if (int003Lines != null && int003Lines.Count > 0)
+            {
+                foreach (var line in int003Lines)
+                {
+                    await InsertLineAsync("INT003", "INT003", "INT003", 0, line);
+                }
+            }
+            else
+            {
+                await InsertLineAsync("INT003", "INT003", "INT003", 0, "Completed ---");
+            }
 
             // Banking Issues
             var bankingStatusText = workdayReportData?.BankingStatus ?? "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
             await InsertLineAsync("Banking Issues", "Banking", "Banking", 0, bankingStatusText);
 
             // Acumatica Issues (INT008/INT024)
-            var int008StatusText = workdayReportData?.Int008Status ?? "COMPLETED  OK";
-            var int008RangeText = workdayReportData?.Int008ReferenceRange != null ? $" | {workdayReportData.Int008ReferenceRange}" : string.Empty;
-            await InsertLineAsync("Acumatica Issues", "INT008", "INT008 - Journals", 0, $"INT008 - Journals - {int008StatusText}{int008RangeText}");
+            var int008Lines = workdayReportData?.Int008Lines;
+            if (int008Lines != null && int008Lines.Count > 0)
+            {
+                foreach (var line in int008Lines)
+                {
+                    await InsertLineAsync("Acumatica Issues", "INT008", "INT008 - Journals", 0, line);
+                }
+            }
+            else
+            {
+                await InsertLineAsync("Acumatica Issues", "INT008", "INT008 - Journals", 0, "INT008 - Journals - COMPLETED  OK");
+            }
 
-            var int024StatusText = workdayReportData?.Int024Status ?? "COMPLETED  OK";
-            var int024RangeText = workdayReportData?.Int024ReferenceRange != null ? $" | {workdayReportData.Int024ReferenceRange}" : string.Empty;
-            await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, $"INT024 - AHBT     - {int024StatusText}{int024RangeText}");
+            var int024Lines = workdayReportData?.Int024Lines;
+            if (int024Lines != null && int024Lines.Count > 0)
+            {
+                foreach (var line in int024Lines)
+                {
+                    await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, line);
+                }
+            }
+            else
+            {
+                await InsertLineAsync("Acumatica Issues", "INT024", "INT024 - AHBT", 0, "INT024 - AHBT     - COMPLETED  OK");
+            }
 
             // DLQ
             if (dlqStatusText != null)
