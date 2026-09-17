@@ -87,6 +87,23 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private const string FailedFolderName = "Failed";
         private const string IntegrationDisplayName = "INT002 PayGlobal Worker Inbound";
 
+        /// <summary>
+        /// A palette of eye-catching bullet symbols. One is picked at random each run (see
+        /// <see cref="PickBulletSymbol"/>) and used consistently for every bullet line in that
+        /// run's report, so the report looks a little different (and hopefully more attention
+        /// grabbing) each morning without being inconsistent within a single report.
+        /// </summary>
+        private static readonly string[] BulletSymbols =
+        {
+            "\u2666", // ? diamond
+            "\u2605", // ? star
+            "\u26A1", // ? lightning bolt
+            "\u2714", // ? check mark
+            "\u25C6", // ? black diamond
+            "\u2733", // ? eight spoked asterisk
+            "\u27A4"  // ? arrow
+        };
+
         private readonly ILogger<Int002SyncService> _logger;
         private readonly ISftpService _sftpService;
         private readonly IDatabaseService _databaseService;
@@ -836,15 +853,16 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             var reportFileName = $"MorningJobReport_{reportDate:dd-MM-yyyy}.txt";
             var reportFilePath = Path.Combine(workUploadDir, reportFileName);
             var isMonday = reportDate.DayOfWeek == DayOfWeek.Monday;
+            var bullet = PickBulletSymbol(reportDate);
 
             var sb = new StringBuilder();
             sb.AppendLine("*Pay Global Issues*");
             sb.AppendLine("*INT002*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
 
-            AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts, isMonday);
-            AppendInt002Line(sb, "NonManagerWorkerData", failedFileErrorCounts, isMonday);
-            AppendInt002Line(sb, "ManagerWorkerData", failedFileErrorCounts, isMonday);
+            AppendInt002Line(sb, "SupervisoryOrgData", failedFileErrorCounts, isMonday, bullet);
+            AppendInt002Line(sb, "NonManagerWorkerData", failedFileErrorCounts, isMonday, bullet);
+            AppendInt002Line(sb, "ManagerWorkerData", failedFileErrorCounts, isMonday, bullet);
 
             sb.AppendLine();
             if (failedFileErrorCounts.Count > 0)
@@ -864,18 +882,18 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             {
                 foreach (var line in int003Lines)
                 {
-                    sb.AppendLine($" \u2666 {line}");
+                    sb.AppendLine($" {bullet} {line}");
                 }
             }
             else
             {
-                sb.AppendLine($" \u2666 Completed --- | recorded on {FormatOrdinalDate(reportDate)}");
+                sb.AppendLine($" {bullet} Completed --- | recorded on {FormatOrdinalDate(reportDate)}");
             }
             sb.AppendLine();
             sb.AppendLine("*Banking Issues*");
             sb.AppendLine($"Banking Issues recorded on {FormatOrdinalDate(reportDate)}");
             var bankingStatusText = workdayReportData?.BankingStatus ?? "Westpac/ANZ/CBA - (No retrieved documents found) as usual";
-            sb.AppendLine($" \u2666 {bankingStatusText}");
+            sb.AppendLine($" {bullet} {bankingStatusText}");
             sb.AppendLine();
             sb.AppendLine("*Acumatica Issues*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
@@ -884,12 +902,12 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             {
                 foreach (var line in int008Lines)
                 {
-                    sb.AppendLine($" \u2666 {line}");
+                    sb.AppendLine($" {bullet} {line}");
                 }
             }
             else
             {
-                sb.AppendLine(" \u2666 INT008 - Journals - COMPLETED  OK");
+                sb.AppendLine($" {bullet} INT008 - Journals - COMPLETED  OK");
             }
             sb.AppendLine();
             var int024Lines = workdayReportData?.Int024Lines;
@@ -897,12 +915,12 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             {
                 foreach (var line in int024Lines)
                 {
-                    sb.AppendLine($" \u2666 {line}");
+                    sb.AppendLine($" {bullet} {line}");
                 }
             }
             else
             {
-                sb.AppendLine(" \u2666 INT024 - AHBT - COMPLETED  OK");
+                sb.AppendLine($" {bullet} INT024 - AHBT - COMPLETED  OK");
             }
             sb.AppendLine();
             sb.AppendLine("*GTV, Prism, & Stripe Issues*");
@@ -913,13 +931,13 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             {
                 foreach (var line in dlqStatusText)
                 {
-                    sb.AppendLine($" \u2666 {line}");
+                    sb.AppendLine($" {bullet} {line}");
                 }
             }
             else
             {
-                sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue");
-                sb.AppendLine(" \u2666 0 Messages on payout-transactions-queue-dlq  ");
+                sb.AppendLine($" {bullet} 0 Messages on payout-transactions-queue");
+                sb.AppendLine($" {bullet} 0 Messages on payout-transactions-queue-dlq  ");
             }
             sb.AppendLine();
             sb.AppendLine("S3:");
@@ -934,15 +952,15 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
                         sb.AppendLine();
                     }
 
-                    sb.AppendLine($" \u2666 {BuildS3BucketLineText(bucketLine)}");
+                    sb.AppendLine($" {bullet} {BuildS3BucketLineText(bucketLine)}");
                     previousBucketName = bucketLine.BucketName;
                 }
             }
             else
             {
-                sb.AppendLine(" \u2666 stripe-payout-workday-adapter-bucket - 0 FAILED 0 NEW  0 PROCESSED  ON - " + reportDate.ToString("dd-MM-yyyy"));
-                sb.AppendLine(" \u2666 phoenix-prd-prism-integration        - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
-                sb.AppendLine(" \u2666 gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+                sb.AppendLine($" {bullet} stripe-payout-workday-adapter-bucket - 0 FAILED 0 NEW  0 PROCESSED  ON - " + reportDate.ToString("dd-MM-yyyy"));
+                sb.AppendLine($" {bullet} phoenix-prd-prism-integration        - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
+                sb.AppendLine($" {bullet} gt-transaction-prism-bucket          - 0 FAILED 0 NEW  Recorded      ON - " + reportDate.ToString("dd-MM-yyyy"));
             }
             sb.AppendLine();
             sb.AppendLine("*Sumo Failure Logs*");
@@ -951,41 +969,53 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             {
                 foreach (var line in sumoFailureLogLines)
                 {
-                    sb.AppendLine($" \u2666 {line}");
+                    sb.AppendLine($" {bullet} {line}");
                 }
             }
             else
             {
-                sb.AppendLine(" \u2666 No failed processes reported.");
+                sb.AppendLine($" {bullet} No failed processes reported.");
             }
             sb.AppendLine();
             sb.AppendLine($"*DB* - Recorded on {FormatOrdinalDate(reportDate)}");
             var stripeLatestCompletedText = stripeLatestCompleted.HasValue
                 ? stripeLatestCompleted.Value.ToString("dd-MM-yyyy HH:mm")
                 : "Unavailable";
-            sb.AppendLine($" \u2666 Stripe Latest completed - {stripeLatestCompletedText}");
+            sb.AppendLine($" {bullet} Stripe Latest completed - {stripeLatestCompletedText}");
             sb.AppendLine();
             sb.AppendLine("*Miscellaneous Issues*");
             sb.AppendLine();
             sb.AppendLine("*XE*");
             var xeStatusText = workdayReportData?.XeStatus ?? "No issues reported.";
-            sb.AppendLine($" \u2666 {xeStatusText}");
+            sb.AppendLine($" {bullet} {xeStatusText}");
             sb.AppendLine();
             sb.AppendLine("*Workday Community Updates:*");
-            sb.AppendLine(" \u2666 No significant updates reported.");
+            sb.AppendLine($" {bullet} No significant updates reported.");
             sb.AppendLine();
             sb.AppendLine("*Items to Follow Up*");
-            sb.AppendLine(" \u2666 None.");
+            sb.AppendLine($" {bullet} None.");
 
             File.WriteAllText(reportFilePath, sb.ToString());
             return reportFilePath;
+        }
+
+        /// <summary>
+        /// Deterministically picks one of the <see cref="BulletSymbols"/> for the given report
+        /// date, so the bullet symbol changes from day to day (keeping the morning report a
+        /// little less repetitive) while staying identical for every line within the same run.
+        /// </summary>
+        private static string PickBulletSymbol(DateTime reportDate)
+        {
+            var index = reportDate.Date.GetHashCode() & int.MaxValue;
+            return BulletSymbols[index % BulletSymbols.Length];
         }
 
         private static void AppendInt002Line(
             StringBuilder sb,
             string itemName,
             List<(string NormalizedFileName, int ErrorCount, List<int> ErrorRowNumbers, DateOnly? FileDate)> failedFileErrorCounts,
-            bool isMonday)
+            bool isMonday,
+            string bullet)
         {
             var matches = failedFileErrorCounts
                 .Where(f => string.Equals(f.NormalizedFileName, itemName, StringComparison.OrdinalIgnoreCase))
@@ -994,7 +1024,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
 
             if (matches.Count == 0)
             {
-                sb.AppendLine($" \u2666{itemName,-22}- 0 Data Errors(s)");
+                sb.AppendLine($" {bullet}{itemName,-22}- 0 Data Errors(s)");
                 return;
             }
 
@@ -1009,14 +1039,14 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
                     var errorWord = match.ErrorCount == 1 ? "Error" : "Errors";
                     var dateText = match.FileDate.HasValue ? $" ({match.FileDate.Value:dd-MM-yyyy})" : string.Empty;
 
-                    sb.AppendLine($" \u2666{itemName,-22}- {match.ErrorCount} Data {errorWord}(s){dateText}");
+                    sb.AppendLine($" {bullet}{itemName,-22}- {match.ErrorCount} Data {errorWord}(s){dateText}");
                 }
             }
             else
             {
                 var errorCount = matches.Sum(m => m.ErrorCount);
                 var errorWord = errorCount == 1 ? "Error" : "Errors";
-                sb.AppendLine($" \u2666{itemName,-22}- {errorCount} Data {errorWord}(s)");
+                sb.AppendLine($" {bullet}{itemName,-22}- {errorCount} Data {errorWord}(s)");
             }
         }
 
