@@ -250,6 +250,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
                     s3BucketReportLines);
 
                 OpenFolderInExplorer(workUploadDir);
+                OpenFileInEditor(reportFilePath);
             }
             finally
             {
@@ -394,6 +395,49 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to open work upload folder {FolderPath} in Explorer.", folderPath);
+            }
+        }
+
+        /// <summary>
+        /// Default Notepad++ install location, used when AppSettings:Int002Sync:NotepadPlusPlusPath
+        /// isn't configured.
+        /// </summary>
+        private const string DefaultNotepadPlusPlusPath = @"C:\Program Files\Notepad++\notepad++.exe";
+
+        /// <summary>
+        /// Opens the given file with Notepad++ if it's installed at the configured (or default)
+        /// path. This is a generic "open with editor if present" helper: if the editor
+        /// executable isn't found, this simply logs and returns without throwing, so the program
+        /// can continue/exit gracefully instead of failing the run just because the editor isn't
+        /// installed on this machine.
+        /// </summary>
+        private void OpenFileInEditor(string filePath)
+        {
+            var editorPath = string.IsNullOrWhiteSpace(_settings.NotepadPlusPlusPath)
+                ? DefaultNotepadPlusPlusPath
+                : _settings.NotepadPlusPlusPath;
+
+            if (!File.Exists(editorPath))
+            {
+                _logger.LogInformation(
+                    "Notepad++ not found at {EditorPath}. Skipping auto-open of report file {FilePath}.",
+                    editorPath, filePath);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = editorPath,
+                    Arguments = $"\"{filePath}\"",
+                    UseShellExecute = true
+                });
+                _logger.LogInformation("Opened report file {FilePath} in Notepad++.", filePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to open report file {FilePath} in Notepad++ at {EditorPath}.", filePath, editorPath);
             }
         }
 

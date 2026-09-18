@@ -282,5 +282,13 @@ namespace Bot.MorningJob.Console
         public string? LocalRootPath { get; set; }
         public string? SqlConnectionString { get; set; }
         public string? WorkUploadRootPath { get; set; }
+
+        /// <summary>
+        /// Full path to the Notepad++ executable used to open the generated morning report
+        /// file. Defaults to "C:\Program Files\Notepad++\notepad++.exe" if not configured. If
+        /// the executable isn't found at the configured (or default) path, the report simply
+        /// won't be auto-opened and the program continues/exits gracefully.
+        /// </summary>
+        public string? NotepadPlusPlusPath { get; set; }
     }
 }
