@@ -15,6 +15,46 @@ This automation bot performs the following tasks each morning:
 5. **PostgreSQL Database** - Retrieves and aggregates execution logs
 6. **Report Generation** - Compiles all results into a comprehensive report
 
+## Dependencies & Minimum Requirements
+
+To build and run this application, the following are required:
+
+### Runtime
+- **.NET 8 SDK/Runtime** (`net8.0`)
+- **Windows** recommended — some helper behavior (e.g. auto-opening the report in Notepad++) is Windows-specific;
+  the rest of the app is cross-platform .NET.
+
+### External services (all required for a full successful run)
+
+| Dependency | Purpose | Config section |
+|---|---|---|
+| **SFTP server** (`mft.myob.com`) | Source of INT002 processed/failed files; requires a private key (`.ppk`) | `AppSettings:Sftp` |
+| **SQL Server** | Stores job run state, processed file records, S3 scan state, and Workday integration log history | `AppSettings:Int002Sync:SqlConnectionString` |
+| **AWS** (S3, SQS, STS) | Monitors integration buckets (failed/new/processed counts) and payout queues; may require an assumable cross-account role | `AppSettings:Aws` |
+| **Workday API** | Fetches integration run status/logs via OAuth2 + custom report API | `AppSettings:Workday` |
+| **PostgreSQL** (via local pgweb proxy) | Reads latest Stripe payout event date | `AppSettings:Database` |
+| **Notepad++** (optional) | Auto-opens the generated report after each run; skipped gracefully if missing | `AppSettings:Int002Sync:NotepadPlusPlusPath` |
+
+### NuGet packages
+See `src/Bot.MorningJob.Console/Bot.MorningJob.Console.csproj` for exact versions:
+`SSH.NET`, `AWSSDK.S3`/`SQS`/`Core`, `Npgsql`, `Npgsql.EntityFrameworkCore.PostgreSQL`,
+`Microsoft.Data.SqlClient`, `Serilog` (+ Console/File sinks), `Microsoft.Extensions.Configuration.*` /
+`DependencyInjection` / `Options`, `Newtonsoft.Json`.
+
+### Minimum setup to run on a new machine
+1. Install the .NET 8 SDK.
+2. `dotnet restore`.
+3. Copy `src/Bot.MorningJob.Console/appsettings.template.json` to `appsettings.json` (git-ignored) and fill in
+   real values for SFTP, AWS, Workday, and `Int002Sync:SqlConnectionString`.
+4. Place the SFTP private key (`.ppk`) at the path referenced by `Sftp:PrivateKeyPath` /
+   `PrivateKeyWorkingCopyPath` — these key files are git-ignored and must be transferred securely, not via git.
+5. Ensure the target SQL Server instance is reachable and has the expected tables.
+6. (Optional) Start the Postgres proxy: `myob-auth kube db-proxy -d stripe-db -n billing-platform`.
+7. `dotnet run --project src/Bot.MorningJob.Console`.
+
+> **Never commit** `appsettings.json`, `appsettings.Development.json`, or `*.ppk` files — they are excluded via
+> `.gitignore`. Only `appsettings.template.json` (with blank placeholders) is tracked in source control.
+
 ## Project Structure
 
 ```
