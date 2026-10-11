@@ -649,7 +649,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             if (status.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
                 status.Contains("Failed", StringComparison.OrdinalIgnoreCase))
             {
-                return "COMPLETED  ERROR";
+                return "COMPLETED WITH ERROR";
             }
 
             if (status.Contains("Completed", StringComparison.OrdinalIgnoreCase))
