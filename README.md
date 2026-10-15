@@ -238,10 +238,28 @@ The application generates comprehensive reports containing:
 - Database query results
 - Summary of all morning jobs
 
+Each report begins with a weekday-specific heading (distinct style for Monday through Friday) showing the
+day name and date for audit purposes, e.g.:
+```
+✔ DAILY WORKDAY INTEGRATION MONITORING REPORT ✔
+★ On a Fabulous Friday Morning — 16-Oct-2026
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+The report is designed to be copied/pasted directly into a Teams channel.
+
 Reports can be generated in:
 - HTML format (default)
 - JSON format
 - CSV format (TBD)
+
+## Command-Line Options
+
+- `--rollback-last-run` — reverts everything created by the most recent job run (job run record,
+  copied file records, report, Workday log entries, S3 tracking rows) and deletes the generated report file.
+  Useful for re-testing a run without waiting for the next scheduled day, e.g.:
+  ```bash
+  dotnet run --project src/Bot.MorningJob.Console -- --rollback-last-run
+  ```
 
 ## Logging
 
