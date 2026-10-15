@@ -900,6 +900,9 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             var bullet = PickBulletSymbol(reportDate);
 
             var sb = new StringBuilder();
+            sb.AppendLine(BuildReportHeading(reportDate));
+            sb.AppendLine(new string('\u2501', 62));
+            sb.AppendLine();
             sb.AppendLine("*Pay Global Issues*");
             sb.AppendLine("*INT002*");
             sb.AppendLine($"Recorded on {FormatOrdinalDate(reportDate)}");
@@ -1039,7 +1042,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             sb.AppendLine("*Items to Follow Up*");
             sb.AppendLine($" {bullet} None.");
 
-            File.WriteAllText(reportFilePath, sb.ToString());
+            File.WriteAllText(reportFilePath, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             return reportFilePath;
         }
 
@@ -1106,6 +1109,33 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             };
 
             return $"{day}{suffix} {date:MMMM}";
+        }
+
+        /// <summary>
+        /// Builds the Teams-friendly report heading. Since the job only runs on weekdays, each
+        /// weekday (Monday-Friday) has its own distinct, upbeat style, while always surfacing the
+        /// day name and date (e.g. "16-Oct-2026") for audit purposes. Time is intentionally
+        /// omitted per report requirements.
+        /// </summary>
+        private static string BuildReportHeading(DateTime reportDate)
+        {
+            var dateText = reportDate.ToString("dd-MMM-yyyy");
+
+            return reportDate.DayOfWeek switch
+            {
+                DayOfWeek.Monday =>
+                    $"\u2726 DAILY WORKDAY INTEGRATION MONITORING REPORT \u2726\n\u2600 On a Fine Monday Morning \u2014 {dateText}",
+                DayOfWeek.Tuesday =>
+                    $"\u25B2 DAILY WORKDAY INTEGRATION MONITORING REPORT \u25B2\n\u26A1 On a Terrific Tuesday Morning \u2014 {dateText}",
+                DayOfWeek.Wednesday =>
+                    $"\u2605 DAILY WORKDAY INTEGRATION MONITORING REPORT \u2605\n\u2699 On a Wonderful Wednesday Morning \u2014 {dateText}",
+                DayOfWeek.Thursday =>
+                    $"\u25C6 DAILY WORKDAY INTEGRATION MONITORING REPORT \u25C6\n\u2764 On a Thriving Thursday Morning \u2014 {dateText}",
+                DayOfWeek.Friday =>
+                    $"\u2714 DAILY WORKDAY INTEGRATION MONITORING REPORT \u2714\n\u2605 On a Fabulous Friday Morning \u2014 {dateText}",
+                _ =>
+                    $"\u25A0 DAILY WORKDAY INTEGRATION MONITORING REPORT \u25A0\nOn {reportDate.DayOfWeek} \u2014 {dateText}"
+            };
         }
 
         private async Task CreateReportAsync(
