@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using Bot.MorningJob.Console.Integrations.Database;
 using Bot.MorningJob.Console.Integrations.Workday;
 using Bot.MorningJob.Console.Integrations.Aws;
+using Bot.MorningJob.Console.Integrations.Teams;
 
 namespace Bot.MorningJob.Console.Integrations.Int002
 {
@@ -110,6 +111,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         private readonly IWorkdayService _workdayService;
         private readonly IAwsService _awsService;
         private readonly IS3BucketMonitorService _s3BucketMonitorService;
+        private readonly ITeamsNotifier _teamsNotifier;
         private readonly SftpSettings _sftpSettings;
         private readonly Int002SyncSettings _settings;
         private readonly AwsSettings _awsSettings;
@@ -121,6 +123,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             IWorkdayService workdayService,
             IAwsService awsService,
             IS3BucketMonitorService s3BucketMonitorService,
+            ITeamsNotifier teamsNotifier,
             IOptions<AppSettings> appSettings)
         {
             _logger = logger;
@@ -129,6 +132,7 @@ namespace Bot.MorningJob.Console.Integrations.Int002
             _workdayService = workdayService;
             _awsService = awsService;
             _s3BucketMonitorService = s3BucketMonitorService;
+            _teamsNotifier = teamsNotifier;
             _sftpSettings = appSettings.Value.Sftp ?? new SftpSettings();
             _settings = appSettings.Value.Int002Sync ?? new Int002SyncSettings();
             _awsSettings = appSettings.Value.Aws ?? new AwsSettings();
@@ -251,6 +255,8 @@ namespace Bot.MorningJob.Console.Integrations.Int002
 
                 OpenFolderInExplorer(workUploadDir);
                 OpenFileInEditor(reportFilePath);
+
+                await _teamsNotifier.PostReportAsync(await File.ReadAllTextAsync(reportFilePath));
             }
             finally
             {
@@ -1040,7 +1046,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             sb.AppendLine($" {bullet} No significant updates reported.");
             sb.AppendLine();
             sb.AppendLine("*Items to Follow Up*");
-            sb.AppendLine($" {bullet} None.");
+            sb.AppendLine($" {bullet} Please refer to the morning standup for follow-up items.");
 
             File.WriteAllText(reportFilePath, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             return reportFilePath;

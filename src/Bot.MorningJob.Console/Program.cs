@@ -5,6 +5,7 @@ using Bot.MorningJob.Console.Integrations.SFTP;
 using Bot.MorningJob.Console.Integrations.Int002;
 using Bot.MorningJob.Console.Integrations.Database;
 using Bot.MorningJob.Console.Integrations.Workday;
+using Bot.MorningJob.Console.Integrations.Teams;
 using Serilog;
 using System.Reflection;
 
@@ -50,6 +51,23 @@ namespace Bot.MorningJob.Console
                     return;
                 }
 
+                // Posts an existing report text file to Teams without running any integrations or
+                // touching job-run state (used to test the card/webhook safely).
+                var postFileIndex = Array.FindIndex(args, a => string.Equals(a, "--post-report-file", StringComparison.OrdinalIgnoreCase));
+                if (postFileIndex >= 0)
+                {
+                    if (postFileIndex + 1 >= args.Length || !File.Exists(args[postFileIndex + 1]))
+                    {
+                        Log.Error("--post-report-file requires the path of an existing report text file.");
+                        return;
+                    }
+
+                    var teamsNotifier = serviceProvider.GetRequiredService<ITeamsNotifier>();
+                    var posted = await teamsNotifier.PostReportAsync(await File.ReadAllTextAsync(args[postFileIndex + 1]));
+                    Log.Information(posted ? "Report posted to Teams." : "Report was not posted to Teams.");
+                    return;
+                }
+
                 // Get the main application service
                 var app = serviceProvider.GetRequiredService<IApplicationService>();
                 await app.ExecuteAsync();
@@ -85,6 +103,7 @@ namespace Bot.MorningJob.Console
             services.AddScoped<IWorkdayService, WorkdayService>();
             services.AddScoped<Bot.MorningJob.Console.Integrations.Aws.IAwsService, Bot.MorningJob.Console.Integrations.Aws.AwsService>();
             services.AddScoped<Bot.MorningJob.Console.Integrations.Aws.IS3BucketMonitorService, Bot.MorningJob.Console.Integrations.Aws.S3BucketMonitorService>();
+            services.AddScoped<ITeamsNotifier, TeamsNotifier>();
             services.AddScoped<IInt002SyncService, Int002SyncService>();
 
             // Application service
@@ -178,6 +197,17 @@ namespace Bot.MorningJob.Console
         public DatabaseSettings? Database { get; set; }
         public ReportSettings? Report { get; set; }
         public Int002SyncSettings? Int002Sync { get; set; }
+        public TeamsSettings? Teams { get; set; }
+    }
+
+    public class TeamsSettings
+    {
+        /// <summary>
+        /// Power Automate workflow webhook URL. It embeds a signature (sig=...), so treat it as a
+        /// secret: keep it only in the git-ignored appsettings.json, user secrets, or the
+        /// TEAMS_FLOW_WEBHOOK_URL environment variable - never in a tracked file.
+        /// </summary>
+        public string? WebhookUrl { get; set; }
     }
 
     public class SftpSettings

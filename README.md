@@ -247,6 +247,15 @@ day name and date for audit purposes, e.g.:
 ```
 The report is designed to be copied/pasted directly into a Teams channel.
 
+### Posting to Teams
+
+After the report opens in Notepad++, it is also posted to a Teams channel as an Adaptive Card (the Power
+Automate workflow only accepts card payloads) with a coloured header, one container per section and
+highlighted failure/OK lines. The webhook URL contains a signature secret, so it must **never** be committed:
+set `AppSettings:Teams:WebhookUrl` in the git-ignored `appsettings.json` / user secrets, or set the
+`TEAMS_FLOW_WEBHOOK_URL` environment variable. If neither is set, the Teams post is skipped. A Teams failure
+never fails the job.
+
 Reports can be generated in:
 - HTML format (default)
 - JSON format
@@ -259,6 +268,12 @@ Reports can be generated in:
   Useful for re-testing a run without waiting for the next scheduled day, e.g.:
   ```bash
   dotnet run --project src/Bot.MorningJob.Console -- --rollback-last-run
+  ```
+- `--post-report-file <path>` — posts an existing report `.txt` file to Teams as a card **without running any
+  integrations or touching job-run state** (safe for testing the card/webhook; the last-run timestamp used for
+  the next report's lookback is not affected), e.g.:
+  ```bash
+  dotnet run --project src/Bot.MorningJob.Console -- --post-report-file C:\work\MorningJobReport_16-10-2026.txt
   ```
 
 ## Logging
