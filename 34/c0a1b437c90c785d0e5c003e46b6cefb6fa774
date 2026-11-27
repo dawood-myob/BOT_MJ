@@ -1,0 +1,29 @@
+README.md
+  s_620da9e01fb1b4::t_28a23e3ce35713 218-221,282-285
+src/Bot.MorningJob.Console/Integrations/AWS/IAwsService.cs
+  s_620da9e01fb1b4::t_e8c1410208c70b 50-53,55,199,201-205,207-210,212
+src/Bot.MorningJob.Console/Integrations/Int002/IInt002SyncService.cs
+  s_620da9e01fb1b4::t_31558272a1edc7 82-87,564-565,574,584-636,983
+src/Bot.MorningJob.Console/Integrations/Teams/ITeamsNotifier.cs
+  s_620da9e01fb1b4::t_b70dc78cfcee65 19-21,30,42,44-53
+src/Bot.MorningJob.Console/Program.cs
+  s_620da9e01fb1b4::t_fab0be703e43a8 66-83,256-261,293-302
+src/Bot.MorningJob.Console/appsettings.template.json
+  s_620da9e01fb1b4::t_8b78c2219d4ba2 39-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34c0a1b437c90c785d0e5c003e46b6cefb6fa774",
+  "prompts": {},
+  "sessions": {
+    "s_620da9e01fb1b4": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "s_620da9e01fb1b4",
+        "model": "unknown"
+      },
+      "human_author": "Bot MorningJob <bot@morningjob.local>"
+    }
+  }
+}
