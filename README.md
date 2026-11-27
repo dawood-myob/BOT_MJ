@@ -215,6 +215,10 @@ dotnet user-secrets set "key" "value"
 - Retrieves messages from SQS queue
 - Analyzes message count and age
 - Reports on queue health and processing status
+- Besides `PayoutQueueName`/`PayoutDlqName`, extra queues (e.g. `gt-syncadhocpayment-queue`, which lives in a
+  different AWS account) are configured under `AppSettings:Aws:AdditionalQueues`, each with its own `QueueName`,
+  `RoleArn` and `Region`. They appear in the report's DLQ section; a queue with messages (or one that cannot be
+  read) is flagged `**** Action required`. Keep real role ARNs only in the git-ignored `appsettings.json`.
 
 ### Workday API Integration (`Integrations/Workday/`)
 - Authenticates with Workday OAuth2
@@ -275,6 +279,10 @@ Reports can be generated in:
   ```bash
   dotnet run --project src/Bot.MorningJob.Console -- --post-report-file C:\work\MorningJobReport_16-10-2026.txt
   ```
+- `--post-report-file <path> --dry-run` — builds the Teams card and prints its JSON **without calling the
+  webhook**.
+- `--check-queues` — read-only check of the SQS queues in the DLQ section (including additional queues); prints one
+  line per queue and does not touch the database, files, job-run state or Teams.
 
 ## Logging
 

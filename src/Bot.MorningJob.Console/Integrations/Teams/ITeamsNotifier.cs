@@ -16,7 +16,9 @@ namespace Bot.MorningJob.Console.Integrations.Teams
         /// Converts the report text into an Adaptive Card and posts it to the configured webhook.
         /// Never throws; returns false (after logging) when the post was skipped or failed.
         /// </summary>
-        Task<bool> PostReportAsync(string reportText);
+        /// <param name="reportText">The plain-text morning report.</param>
+        /// <param name="dryRun">When true, the card JSON is only logged and no webhook is called.</param>
+        Task<bool> PostReportAsync(string reportText, bool dryRun = false);
     }
 
     public class TeamsNotifier : ITeamsNotifier
@@ -25,7 +27,7 @@ namespace Bot.MorningJob.Console.Integrations.Teams
 
         private static readonly HttpClient HttpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
         private static readonly Regex SectionHeaderRegex = new(@"^\*(?<title>.+?)\*(?<extra>.*)$", RegexOptions.Compiled);
-        private static readonly Regex ProblemLineRegex = new(@"(?<!\d)[1-9]\d* FAILED|\bFailed\b|[1-9]\d* Data Errors?\(s\)|COMPLETED WITH ERROR", RegexOptions.Compiled);
+        private static readonly Regex ProblemLineRegex = new(@"(?<!\d)[1-9]\d* FAILED|\bFailed\b|[1-9]\d* Data Errors?\(s\)|COMPLETED WITH ERROR|Action required", RegexOptions.Compiled);
         private static readonly Regex OkLineRegex = new(@"COMPLETED\s+OK", RegexOptions.Compiled);
 
         private readonly ILogger<TeamsNotifier> _logger;
@@ -37,8 +39,18 @@ namespace Bot.MorningJob.Console.Integrations.Teams
             _settings = appSettings.Value.Teams ?? new TeamsSettings();
         }
 
-        public async Task<bool> PostReportAsync(string reportText)
+        public async Task<bool> PostReportAsync(string reportText, bool dryRun = false)
         {
+            if (dryRun)
+            {
+                var json = System.Text.Json.JsonSerializer.Serialize(
+                    BuildCardPayload(reportText),
+                    new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                System.Console.WriteLine(json);
+                _logger.LogInformation("Dry run: Teams card built but NOT posted (no webhook called).");
+                return false;
+            }
+
             var webhookUrl = string.IsNullOrWhiteSpace(_settings.WebhookUrl)
                 ? Environment.GetEnvironmentVariable(WebhookEnvironmentVariable)
                 : _settings.WebhookUrl;

@@ -79,6 +79,12 @@ namespace Bot.MorningJob.Console.Integrations.Int002
         /// like a genuine first run for that day.
         /// </summary>
         Task<bool> RollbackLastRunAsync();
+
+        /// <summary>
+        /// Read-only check of the SQS queues shown in the DLQ section (including any additional
+        /// queues). Does not touch the database, files or any job-run state.
+        /// </summary>
+        Task<List<string>> CheckQueuesAsync();
     }
 
     public class Int002SyncService : IInt002SyncService
@@ -555,6 +561,8 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
         /// </summary>
         private async Task<List<string>?> TryFetchDlqStatusTextAsync()
         {
+            List<string>? lines = null;
+
             try
             {
                 var queueName = string.IsNullOrWhiteSpace(_awsSettings.PayoutQueueName) ? "payout-transactions-queue" : _awsSettings.PayoutQueueName;
@@ -563,7 +571,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
                 var queueStatus = await _awsService.GetQueueMessageCountAsync(queueName);
                 var dlqStatus = await _awsService.GetQueueMessageCountAsync(dlqName);
 
-                return new List<string>
+                lines = new List<string>
                 {
                     BuildQueueStatusLine(queueStatus),
                     BuildQueueStatusLine(dlqStatus)
@@ -572,8 +580,60 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to fetch SQS queue message counts for the DLQ report section.");
-                return null;
             }
+
+            var additionalLines = await FetchAdditionalQueueLinesAsync();
+            if (additionalLines.Count == 0)
+            {
+                return lines;
+            }
+
+            // If the primary queues could not be checked, keep the report's usual placeholder lines
+            // so the additional queues are still reported.
+            lines ??= new List<string>
+            {
+                "0 Messages on payout-transactions-queue",
+                "0 Messages on payout-transactions-queue-dlq"
+            };
+            lines.AddRange(additionalLines);
+            return lines;
+        }
+
+        /// <summary>
+        /// Checks every queue configured in AppSettings:Aws:AdditionalQueues (each via its own
+        /// role/region). A failure on one queue is reported on that queue's line and flagged for
+        /// action rather than hidden, and never prevents the other queues or the report.
+        /// </summary>
+        private async Task<List<string>> FetchAdditionalQueueLinesAsync()
+        {
+            var lines = new List<string>();
+
+            foreach (var queue in _awsSettings.AdditionalQueues ?? new List<SqsQueueConfig>())
+            {
+                if (string.IsNullOrWhiteSpace(queue.QueueName))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var status = await _awsService.GetQueueMessageCountAsync(queue.QueueName, queue.RoleArn, queue.Region);
+                    lines.Add(BuildQueueStatusLine(status));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to fetch SQS queue message count for {QueueName}.", queue.QueueName);
+                    lines.Add($"{queue.QueueName} - Unable to retrieve message count **** Action required");
+                }
+            }
+
+            return lines;
+        }
+
+        public async Task<List<string>> CheckQueuesAsync()
+        {
+            var lines = await TryFetchDlqStatusTextAsync() ?? new List<string>();
+            return lines;
         }
 
         private static string BuildQueueStatusLine(SqsQueueStatus status)
@@ -920,8 +980,7 @@ DELETE FROM JobRun WHERE JobRunId = @JobRunId;";
             sb.AppendLine();
             if (failedFileErrorCounts.Count > 0)
             {
-                sb.AppendLine("Action Taken: Error file(s) uploaded to :");
-                sb.AppendLine("https://myobo365.sharepoint.com/:f:/r/sites/GSWorkdayPlatform/Integrations/PayGlobal/Error%20files%20%5Bto%20be%20checked%5D?csf=1&web=1&e=c2GefJ");
+                sb.AppendLine("Action Taken: Error file(s) have been uploaded to the PG SharePoint shared folder.");
             }
             else
             {

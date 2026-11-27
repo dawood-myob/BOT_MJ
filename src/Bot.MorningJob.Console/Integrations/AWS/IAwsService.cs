@@ -47,10 +47,12 @@ namespace Bot.MorningJob.Console.Integrations.Aws
         Task<AWSCredentials> GetCredentialsAsync(string roleArn);
 
         /// <summary>
-        /// Gets the approximate number of visible messages for the given queue name, using the
-        /// role configured in AppSettings:Aws:RoleArn.
+        /// Gets the approximate number of visible messages for the given queue name. Uses the role
+        /// configured in AppSettings:Aws:RoleArn unless <paramref name="roleArn"/> is supplied (for
+        /// queues that live in a different AWS account), and the default region unless
+        /// <paramref name="region"/> is supplied.
         /// </summary>
-        Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName);
+        Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName, string? roleArn = null, string? region = null);
 
         /// <summary>
         /// Verifies connectivity/access to the given S3 bucket by assuming the given role and
@@ -194,15 +196,20 @@ namespace Bot.MorningJob.Console.Integrations.Aws
             return (accessKeyId, secretAccessKey, sessionToken);
         }
 
-        public async Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName)
+        public async Task<SqsQueueStatus> GetQueueMessageCountAsync(string queueName, string? roleArn = null, string? region = null)
         {
-            var roleArn = _settings.RoleArn
-                ?? throw new InvalidOperationException("AppSettings:Aws:RoleArn is not configured.");
+            var effectiveRoleArn = string.IsNullOrWhiteSpace(roleArn) ? _settings.RoleArn : roleArn;
+            if (string.IsNullOrWhiteSpace(effectiveRoleArn))
+            {
+                throw new InvalidOperationException("AppSettings:Aws:RoleArn is not configured.");
+            }
 
-            var credentials = await GetCredentialsAsync(roleArn);
-            var region = string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region;
+            var credentials = await GetCredentialsAsync(effectiveRoleArn);
+            var effectiveRegion = !string.IsNullOrWhiteSpace(region)
+                ? region
+                : (string.IsNullOrWhiteSpace(_settings.Region) ? "ap-southeast-2" : _settings.Region);
 
-            using var sqsClient = new AmazonSQSClient(credentials, RegionEndpoint.GetBySystemName(region));
+            using var sqsClient = new AmazonSQSClient(credentials, RegionEndpoint.GetBySystemName(effectiveRegion));
 
             var queueUrlResponse = await sqsClient.GetQueueUrlAsync(queueName);
 

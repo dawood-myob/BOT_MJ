@@ -63,8 +63,24 @@ namespace Bot.MorningJob.Console
                     }
 
                     var teamsNotifier = serviceProvider.GetRequiredService<ITeamsNotifier>();
-                    var posted = await teamsNotifier.PostReportAsync(await File.ReadAllTextAsync(args[postFileIndex + 1]));
-                    Log.Information(posted ? "Report posted to Teams." : "Report was not posted to Teams.");
+                    var dryRun = args.Any(a => string.Equals(a, "--dry-run", StringComparison.OrdinalIgnoreCase));
+                    var posted = await teamsNotifier.PostReportAsync(await File.ReadAllTextAsync(args[postFileIndex + 1]), dryRun);
+                    if (!dryRun)
+                    {
+                        Log.Information(posted ? "Report posted to Teams." : "Report was not posted to Teams.");
+                    }
+                    return;
+                }
+
+                // Read-only SQS check (no database/file/job-run changes, no Teams post).
+                if (args.Any(a => string.Equals(a, "--check-queues", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var queueLines = await serviceProvider.GetRequiredService<IInt002SyncService>().CheckQueuesAsync();
+                    foreach (var line in queueLines)
+                    {
+                        System.Console.WriteLine(line);
+                    }
+
                     return;
                 }
 
@@ -237,6 +253,12 @@ namespace Bot.MorningJob.Console
         public string? PayoutDlqName { get; set; } = "payout-transactions-queue-dlq";
         public S3Settings? S3 { get; set; }
         public SqsSettings? Sqs { get; set; }
+
+        /// <summary>
+        /// Extra SQS queues to report on in the DLQ section, e.g. queues that live in another AWS
+        /// account and are reached via their own role.
+        /// </summary>
+        public List<SqsQueueConfig>? AdditionalQueues { get; set; }
         public List<S3BucketConfig>? MonitoredBuckets { get; set; }
     }
 
@@ -266,6 +288,16 @@ namespace Bot.MorningJob.Console
     {
         public string? BucketName { get; set; }
         public List<string>? MonitoredPrefixes { get; set; }
+    }
+
+    /// <summary>
+    /// An additional SQS queue to monitor, accessed through its own (possibly cross-account) role.
+    /// </summary>
+    public class SqsQueueConfig
+    {
+        public string? QueueName { get; set; }
+        public string? RoleArn { get; set; }
+        public string? Region { get; set; }
     }
 
     public class SqsSettings
